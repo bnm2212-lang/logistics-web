@@ -26,7 +26,7 @@ import {
   Truck,
 } from 'lucide-react';
 import './styles.css';
-import { supabase } from './lib/supabase';
+import { isSupabaseConfigured, supabase } from './lib/supabase';
 
 const inventoryItems = [
   { id: 'MILK-01', name: '우유', category: '유제품', supplier: '서울 데일리팜', currentStock: 10, requiredStock: 34, unit: 'L', unitCost: 2600, psi: 37, dailySalesChange: 22, weeklyConsumption: 126, forecastSales: 52, actualSales: 44, stockoutHours: 7, leadTimeHours: 18, reason: '토요일, 비 예보, 관광객 증가 사례가 겹쳐 라떼류 수요가 커집니다.' },
@@ -276,6 +276,18 @@ function normalizeCartItem(row, inventoryById) {
   };
 }
 
+function initialCartFromItems(items) {
+  return Object.fromEntries(items.filter((item) => item.shortage > 0).map((item) => [item.id, item]));
+}
+
+function selectedIdsFromCart(cart) {
+  return Object.keys(cart);
+}
+
+function errorMessage(error) {
+  return error?.message || '알 수 없는 오류가 발생했습니다.';
+}
+
 function App() {
   const [activePage, setActivePage] = useState('analysis');
   const [events, setEvents] = useState(eventSeed);
@@ -288,8 +300,8 @@ function App() {
   const [supabaseItems, setSupabaseItems] = useState([]);
 
   const items = useMemo(() => (supabaseItems.length ? supabaseItems : inventoryItems).map(enrichItem), [supabaseItems]);
-  const [cart, setCart] = useState(() => Object.fromEntries(items.filter((item) => item.shortage > 0).map((item) => [item.id, item])));
-  const [selectedIds, setSelectedIds] = useState(() => items.filter((item) => item.shortage > 0).map((item) => item.id));
+  const [cart, setCart] = useState(() => initialCartFromItems(inventoryItems.map(enrichItem)));
+  const [selectedIds, setSelectedIds] = useState(() => selectedIdsFromCart(initialCartFromItems(inventoryItems.map(enrichItem))));
 
   const cartItems = Object.values(cart);
   const selectedItems = cartItems.filter((item) => selectedIds.includes(item.id));
@@ -306,31 +318,44 @@ function App() {
     let active = true;
 
     async function loadSupabaseData() {
-      const { data: inventoryRows, error: inventoryError } = await supabase.from('inventory_items').select('*');
-      if (!active) return;
-
-      if (inventoryError) {
-        showToast(`Supabase inventory_items 오류: ${inventoryError.message}`);
-      } else if (inventoryRows?.length) {
-        setSupabaseItems(inventoryRows.map(normalizeInventoryItem));
-      }
-
-      const sourceItems = inventoryRows?.length ? inventoryRows.map(normalizeInventoryItem).map(enrichItem) : items;
-      const inventoryById = Object.fromEntries(sourceItems.map((item) => [item.id, item]));
-      const { data: cartRows, error: cartError } = await supabase.from('cart_items').select('*');
-      if (!active) return;
-
-      if (cartError) {
-        showToast(`Supabase cart_items 오류: ${cartError.message}`);
+      if (!isSupabaseConfigured) {
+        showToast('Supabase 설정이 없어 Mock Data로 표시합니다.');
         return;
       }
 
-      const nextCart = Object.fromEntries((cartRows || []).map((row) => {
-        const item = normalizeCartItem(row, inventoryById);
-        return [item.id, item];
-      }));
-      setCart(nextCart);
-      setSelectedIds(Object.keys(nextCart));
+      try {
+        const { data: inventoryRows, error: inventoryError } = await supabase.from('inventory_items').select('*');
+        if (!active) return;
+
+        let sourceItems = items;
+        if (inventoryError) {
+          showToast(`Supabase inventory_items 오류: ${errorMessage(inventoryError)}. Mock Data로 전환합니다.`);
+        } else if (Array.isArray(inventoryRows) && inventoryRows.length) {
+          const normalizedInventory = inventoryRows.map(normalizeInventoryItem);
+          setSupabaseItems(normalizedInventory);
+          sourceItems = normalizedInventory.map(enrichItem);
+        }
+
+        const inventoryById = Object.fromEntries(sourceItems.map((item) => [item.id, item]));
+        const { data: cartRows, error: cartError } = await supabase.from('cart_items').select('*');
+        if (!active) return;
+
+        if (cartError) {
+          showToast(`Supabase cart_items 오류: ${errorMessage(cartError)}. Mock Data로 전환합니다.`);
+          return;
+        }
+
+        if (Array.isArray(cartRows) && cartRows.length) {
+          const nextCart = Object.fromEntries(cartRows.map((row) => {
+            const item = normalizeCartItem(row, inventoryById);
+            return [item.id, item];
+          }));
+          setCart(nextCart);
+          setSelectedIds(selectedIdsFromCart(nextCart));
+        }
+      } catch (error) {
+        if (active) showToast(`Supabase 연결 오류: ${errorMessage(error)}. Mock Data로 전환합니다.`);
+      }
     }
 
     loadSupabaseData();
@@ -338,21 +363,39 @@ function App() {
   }, []);
 
   async function insertCartItem(item) {
-    const { error } = await supabase.from('cart_items').insert(cartPayload(item));
-    if (error) showToast(`장바구니 추가 오류: ${error.message}`);
-    return !error;
+    if (!isSupabaseConfigured) return true;
+    try {
+      const { error } = await supabase.from('cart_items').insert(cartPayload(item));
+      if (error) showToast(`장바구니 추가 오류: ${errorMessage(error)}. Mock Data로 유지합니다.`);
+      return !error;
+    } catch (error) {
+      showToast(`장바구니 추가 오류: ${errorMessage(error)}. Mock Data로 유지합니다.`);
+      return true;
+    }
   }
 
   async function updateCartItem(item) {
-    const { error } = await supabase.from('cart_items').update(cartPayload(item)).eq('item_id', item.id);
-    if (error) showToast(`장바구니 수정 오류: ${error.message}`);
-    return !error;
+    if (!isSupabaseConfigured) return true;
+    try {
+      const { error } = await supabase.from('cart_items').update(cartPayload(item)).eq('item_id', item.id);
+      if (error) showToast(`장바구니 수정 오류: ${errorMessage(error)}. Mock Data로 유지합니다.`);
+      return !error;
+    } catch (error) {
+      showToast(`장바구니 수정 오류: ${errorMessage(error)}. Mock Data로 유지합니다.`);
+      return true;
+    }
   }
 
   async function deleteCartItems(itemIds) {
-    const { error } = await supabase.from('cart_items').delete().in('item_id', itemIds);
-    if (error) showToast(`장바구니 삭제 오류: ${error.message}`);
-    return !error;
+    if (!isSupabaseConfigured) return true;
+    try {
+      const { error } = await supabase.from('cart_items').delete().in('item_id', itemIds);
+      if (error) showToast(`장바구니 삭제 오류: ${errorMessage(error)}. Mock Data로 유지합니다.`);
+      return !error;
+    } catch (error) {
+      showToast(`장바구니 삭제 오류: ${errorMessage(error)}. Mock Data로 유지합니다.`);
+      return true;
+    }
   }
 
   async function addItemToCart(item) {
@@ -415,23 +458,30 @@ function App() {
   }
 
   async function createSupabaseOrder(order) {
-    const { data: orderRows, error: orderError } = await supabase.from('orders').insert(orderPayload(order)).select('id');
-    if (orderError) {
-      showToast(`발주 저장 오류: ${orderError.message}`);
-      return false;
+    if (!isSupabaseConfigured) return true;
+
+    try {
+      const { data: orderRows, error: orderError } = await supabase.from('orders').insert(orderPayload(order)).select('id');
+      if (orderError) {
+        showToast(`발주 저장 오류: ${errorMessage(orderError)}. Mock Data로 저장합니다.`);
+        return true;
+      }
+
+      const orderId = orderRows?.[0]?.id || order.orderNumber;
+      const { error: itemError } = await supabase
+        .from('order_items')
+        .insert(order.items.map((item) => orderItemPayload(orderId, order.orderNumber, item)));
+
+      if (itemError) {
+        showToast(`발주 품목 저장 오류: ${errorMessage(itemError)}. Mock Data로 저장합니다.`);
+        return true;
+      }
+
+      return deleteCartItems(order.items.map((item) => item.id));
+    } catch (error) {
+      showToast(`발주 저장 오류: ${errorMessage(error)}. Mock Data로 저장합니다.`);
+      return true;
     }
-
-    const orderId = orderRows?.[0]?.id || order.orderNumber;
-    const { error: itemError } = await supabase
-      .from('order_items')
-      .insert(order.items.map((item) => orderItemPayload(orderId, order.orderNumber, item)));
-
-    if (itemError) {
-      showToast(`발주 품목 저장 오류: ${itemError.message}`);
-      return false;
-    }
-
-    return deleteCartItems(order.items.map((item) => item.id));
   }
 
   async function confirmOrder() {
@@ -950,3 +1000,4 @@ function SettingsPage({ mockFail, setMockFail }) {
 }
 
 createRoot(document.getElementById('root')).render(<App />);
+
