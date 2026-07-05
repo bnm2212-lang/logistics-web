@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   AlertTriangle,
@@ -26,6 +26,7 @@ import {
   Truck,
 } from 'lucide-react';
 import './styles.css';
+import { supabase } from './lib/supabase';
 
 const inventoryItems = [
   { id: 'MILK-01', name: '우유', category: '유제품', supplier: '서울 데일리팜', currentStock: 10, requiredStock: 34, unit: 'L', unitCost: 2600, psi: 37, dailySalesChange: 22, weeklyConsumption: 126, forecastSales: 52, actualSales: 44, stockoutHours: 7, leadTimeHours: 18, reason: '토요일, 비 예보, 관광객 증가 사례가 겹쳐 라떼류 수요가 커집니다.' },
@@ -192,6 +193,89 @@ function useFilteredRows(rows, defaultCategory = '전체') {
   return { query, setQuery, category, setCategory, sortKey, setSortKey, page, setPage, pageSize, totalPages, visibleRows, filtered };
 }
 
+function field(row, ...keys) {
+  return keys.map((key) => row?.[key]).find((value) => value !== undefined && value !== null);
+}
+
+function numberField(row, fallback, ...keys) {
+  const value = field(row, ...keys);
+  return value === undefined ? fallback : Number(value || 0);
+}
+
+function normalizeInventoryItem(row) {
+  const id = String(field(row, 'id', 'item_id', 'sku', 'code', 'name') || '');
+  return {
+    id,
+    name: field(row, 'name', 'item_name', 'product_name') || id,
+    category: field(row, 'category', 'type') || '',
+    supplier: field(row, 'supplier', 'supplier_name') || '',
+    currentStock: numberField(row, 0, 'currentStock', 'current_stock', 'stock', 'quantity'),
+    requiredStock: numberField(row, 0, 'requiredStock', 'required_stock', 'minimum_stock', 'target_stock'),
+    unit: field(row, 'unit') || '',
+    unitCost: numberField(row, 0, 'unitCost', 'unit_cost', 'price', 'cost'),
+    psi: numberField(row, 50, 'psi'),
+    dailySalesChange: numberField(row, 0, 'dailySalesChange', 'daily_sales_change'),
+    weeklyConsumption: numberField(row, 0, 'weeklyConsumption', 'weekly_consumption'),
+    forecastSales: numberField(row, 0, 'forecastSales', 'forecast_sales'),
+    actualSales: numberField(row, 0, 'actualSales', 'actual_sales'),
+    stockoutHours: numberField(row, 0, 'stockoutHours', 'stockout_hours'),
+    leadTimeHours: numberField(row, 24, 'leadTimeHours', 'lead_time_hours'),
+    reason: field(row, 'reason', 'memo', 'description') || '',
+  };
+}
+
+function cartPayload(item) {
+  return {
+    item_id: item.id,
+    name: item.name,
+    category: item.category,
+    supplier: item.supplier,
+    current_stock: item.currentStock,
+    required_stock: item.requiredStock,
+    unit: item.unit,
+    unit_cost: item.unitCost,
+    psi: item.psi,
+    order_qty: item.orderQty,
+    status: item.status || 'draft',
+  };
+}
+
+function orderPayload(order) {
+  return {
+    order_number: order.orderNumber,
+    created_at: new Date().toISOString(),
+    item_count: order.itemCount,
+    total_amount: order.totalAmount,
+    supplier: order.supplier,
+    status: order.status,
+  };
+}
+
+function orderItemPayload(orderId, orderNumber, item) {
+  return {
+    order_id: orderId,
+    order_number: orderNumber,
+    item_id: item.id,
+    name: item.name,
+    supplier: item.supplier,
+    unit: item.unit,
+    unit_cost: item.unitCost,
+    order_qty: item.orderQty,
+    total_amount: item.orderQty * item.unitCost,
+    status: item.status || 'ordered',
+  };
+}
+
+function normalizeCartItem(row, inventoryById) {
+  const itemId = String(field(row, 'item_id', 'id') || '');
+  const base = inventoryById[itemId] || normalizeInventoryItem({ ...row, id: itemId });
+  return {
+    ...base,
+    orderQty: numberField(row, base.orderQty || base.recommendedQty || 1, 'orderQty', 'order_qty', 'quantity'),
+    status: field(row, 'status') || 'draft',
+  };
+}
+
 function App() {
   const [activePage, setActivePage] = useState('analysis');
   const [events, setEvents] = useState(eventSeed);
@@ -201,8 +285,9 @@ function App() {
   const [confirmItems, setConfirmItems] = useState([]);
   const [toast, setToast] = useState('');
   const [mockFail, setMockFail] = useState(false);
+  const [supabaseItems, setSupabaseItems] = useState([]);
 
-  const items = useMemo(() => inventoryItems.map(enrichItem), []);
+  const items = useMemo(() => (supabaseItems.length ? supabaseItems : inventoryItems).map(enrichItem), [supabaseItems]);
   const [cart, setCart] = useState(() => Object.fromEntries(items.filter((item) => item.shortage > 0).map((item) => [item.id, item])));
   const [selectedIds, setSelectedIds] = useState(() => items.filter((item) => item.shortage > 0).map((item) => item.id));
 
@@ -217,35 +302,97 @@ function App() {
     window.setTimeout(() => setToast(''), 2400);
   }
 
-  function addItemToCart(item) {
-    setCart((prev) => ({ ...prev, [item.id]: { ...item, status: 'draft' } }));
-    setSelectedIds((prev) => (prev.includes(item.id) ? prev : [...prev, item.id]));
-    showToast(`${item.name}을 장바구니에 담았습니다.`);
+  useEffect(() => {
+    let active = true;
+
+    async function loadSupabaseData() {
+      const { data: inventoryRows, error: inventoryError } = await supabase.from('inventory_items').select('*');
+      if (!active) return;
+
+      if (inventoryError) {
+        showToast(`Supabase inventory_items 오류: ${inventoryError.message}`);
+      } else if (inventoryRows?.length) {
+        setSupabaseItems(inventoryRows.map(normalizeInventoryItem));
+      }
+
+      const sourceItems = inventoryRows?.length ? inventoryRows.map(normalizeInventoryItem).map(enrichItem) : items;
+      const inventoryById = Object.fromEntries(sourceItems.map((item) => [item.id, item]));
+      const { data: cartRows, error: cartError } = await supabase.from('cart_items').select('*');
+      if (!active) return;
+
+      if (cartError) {
+        showToast(`Supabase cart_items 오류: ${cartError.message}`);
+        return;
+      }
+
+      const nextCart = Object.fromEntries((cartRows || []).map((row) => {
+        const item = normalizeCartItem(row, inventoryById);
+        return [item.id, item];
+      }));
+      setCart(nextCart);
+      setSelectedIds(Object.keys(nextCart));
+    }
+
+    loadSupabaseData();
+    return () => { active = false; };
+  }, []);
+
+  async function insertCartItem(item) {
+    const { error } = await supabase.from('cart_items').insert(cartPayload(item));
+    if (error) showToast(`장바구니 추가 오류: ${error.message}`);
+    return !error;
   }
 
-  function addAllRecommendations() {
+  async function updateCartItem(item) {
+    const { error } = await supabase.from('cart_items').update(cartPayload(item)).eq('item_id', item.id);
+    if (error) showToast(`장바구니 수정 오류: ${error.message}`);
+    return !error;
+  }
+
+  async function deleteCartItems(itemIds) {
+    const { error } = await supabase.from('cart_items').delete().in('item_id', itemIds);
+    if (error) showToast(`장바구니 삭제 오류: ${error.message}`);
+    return !error;
+  }
+
+  async function addItemToCart(item) {
+    const nextItem = { ...item, status: 'draft' };
+    const alreadyInCart = Boolean(cart[item.id]);
+    setCart((prev) => ({ ...prev, [item.id]: nextItem }));
+    setSelectedIds((prev) => (prev.includes(item.id) ? prev : [...prev, item.id]));
+    if (alreadyInCart) {
+      if (!(await updateCartItem(nextItem))) return;
+    } else {
+      if (!(await insertCartItem(nextItem))) return;
+    }
+    showToast(`${item.name} 장바구니에 추가했습니다.`);
+  }
+  async function addAllRecommendations() {
+    const nextItems = recommended.map((item) => ({ ...item, status: 'draft' }));
     setCart((prev) => {
       const next = { ...prev };
-      recommended.forEach((item) => { next[item.id] = { ...item, status: 'draft' }; });
+      nextItems.forEach((item) => { next[item.id] = item; });
       return next;
     });
     setSelectedIds((prev) => Array.from(new Set([...prev, ...recommended.map((item) => item.id)])));
-    showToast('추천 발주안을 장바구니에 담았습니다.');
+    const results = await Promise.all(nextItems.map((item) => (cart[item.id] ? updateCartItem(item) : insertCartItem(item))));
+    if (results.every(Boolean)) showToast('추천 항목을 장바구니에 추가했습니다.');
   }
-
-  function updateCartQty(itemId, orderQty) {
-    setCart((prev) => (!prev[itemId] ? prev : { ...prev, [itemId]: { ...prev[itemId], orderQty: Math.max(1, Number(orderQty) || 1) } }));
+  async function updateCartQty(itemId, orderQty) {
+    const nextQty = Math.max(1, Number(orderQty) || 1);
+    const nextItem = cart[itemId] ? { ...cart[itemId], orderQty: nextQty } : null;
+    setCart((prev) => (!prev[itemId] ? prev : { ...prev, [itemId]: { ...prev[itemId], orderQty: nextQty } }));
+    if (nextItem) await updateCartItem(nextItem);
   }
-
-  function removeCartItem(itemId) {
+  async function removeCartItem(itemId) {
     setCart((prev) => {
       const next = { ...prev };
       delete next[itemId];
       return next;
     });
     setSelectedIds((prev) => prev.filter((id) => id !== itemId));
+    if (await deleteCartItems([itemId])) showToast('장바구니에서 삭제했습니다.');
   }
-
   function openOrderConfirm(itemsToOrder) {
     if (!itemsToOrder.length) {
       showToast('발주할 품목을 선택해 주세요.');
@@ -267,7 +414,27 @@ function App() {
     setConfirmItems([orderItem]);
   }
 
-  function confirmOrder() {
+  async function createSupabaseOrder(order) {
+    const { data: orderRows, error: orderError } = await supabase.from('orders').insert(orderPayload(order)).select('id');
+    if (orderError) {
+      showToast(`발주 저장 오류: ${orderError.message}`);
+      return false;
+    }
+
+    const orderId = orderRows?.[0]?.id || order.orderNumber;
+    const { error: itemError } = await supabase
+      .from('order_items')
+      .insert(order.items.map((item) => orderItemPayload(orderId, order.orderNumber, item)));
+
+    if (itemError) {
+      showToast(`발주 품목 저장 오류: ${itemError.message}`);
+      return false;
+    }
+
+    return deleteCartItems(order.items.map((item) => item.id));
+  }
+
+  async function confirmOrder() {
     if (mockFail) {
       showToast('발주 실패 mock 상태입니다.');
       setConfirmItems([]);
@@ -282,6 +449,9 @@ function App() {
       status: 'ordered',
       items: confirmItems,
     };
+    const saved = await createSupabaseOrder(order);
+    if (!saved) return;
+
     setOrders((prev) => [order, ...prev]);
     setCart((prev) => {
       const next = { ...prev };
