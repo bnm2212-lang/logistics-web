@@ -288,20 +288,166 @@ function errorMessage(error) {
   return error?.message || '알 수 없는 오류가 발생했습니다.';
 }
 
+function missingSchemaColumn(error) {
+  const message = errorMessage(error);
+  return message.match(/Could not find the '([^']+)' column/)?.[1] || null;
+}
+
+function omitPayloadColumn(payload, column) {
+  const next = { ...payload };
+  delete next[column];
+  return next;
+}
+
+async function runWithSchemaFallback(makeRequest, payload) {
+  let nextPayload = { ...payload };
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const result = await makeRequest(nextPayload);
+    if (!result.error) return { ok: true, payload: nextPayload };
+
+    const column = missingSchemaColumn(result.error);
+    if (!column || nextPayload[column] === undefined) {
+      return { ok: false, error: result.error, payload: nextPayload };
+    }
+
+    nextPayload = omitPayloadColumn(nextPayload, column);
+  }
+  return { ok: false, error: { message: 'cart_items 컬럼 자동 조정 횟수를 초과했습니다.' }, payload: nextPayload };
+}
+
+function normalizeOrder(row) {
+  return {
+    id: field(row, 'id'),
+    orderNumber: field(row, 'orderNumber', 'order_number') || '',
+    createdAt: field(row, 'createdAt', 'created_at') || '',
+    itemCount: numberField(row, 0, 'itemCount', 'item_count'),
+    totalAmount: numberField(row, 0, 'totalAmount', 'total_amount'),
+    supplier: field(row, 'supplier') || '',
+    status: field(row, 'status') || 'ordered',
+    items: [],
+  };
+}
+
+function normalizeEvent(row) {
+  return {
+    id: field(row, 'id') || Date.now(),
+    date: field(row, 'date', 'created_at') || '',
+    title: field(row, 'title') || '',
+    type: field(row, 'type', 'category') || '지역행사',
+    region: field(row, 'region') || '익산',
+    store: field(row, 'store') || '카페362 익산점',
+    visitors: field(row, 'visitors') || '미정',
+    salesChange: field(row, 'salesChange', 'sales_change') || '분석 대기',
+    volumeChange: field(row, 'volumeChange', 'volume_change') || '분석 대기',
+    items: field(row, 'items') || '미지정',
+    memo: field(row, 'memo') || '운영자 등록',
+    image: field(row, 'image') || '없음',
+    ai: Boolean(field(row, 'ai')),
+  };
+}
+
+function eventPayload(event) {
+  return {
+    date: event.date,
+    title: event.title,
+    type: event.type,
+    region: event.region,
+    store: event.store,
+    visitors: event.visitors,
+    sales_change: event.salesChange,
+    volume_change: event.volumeChange,
+    items: event.items,
+    memo: event.memo,
+    image: event.image,
+    ai: event.ai,
+  };
+}
+
+function normalizeCommunityPost(row) {
+  return {
+    id: field(row, 'id') || Date.now(),
+    category: field(row, 'category') || '발주 고민',
+    title: field(row, 'title') || '',
+    author: field(row, 'author') || '익산 사장님',
+    region: field(row, 'region') || '익산',
+    views: numberField(row, 0, 'views'),
+    comments: numberField(row, 0, 'comments'),
+    likes: numberField(row, 0, 'likes'),
+    time: field(row, 'time', 'created_at') || '방금 전',
+    tags: field(row, 'tags') || [],
+    badge: field(row, 'badge') || '익산 사장님',
+    accepted: Boolean(field(row, 'accepted')),
+    useful: numberField(row, 0, 'useful'),
+    meToo: numberField(row, 0, 'meToo', 'me_too'),
+  };
+}
+
+function communityPayload(post) {
+  return {
+    category: post.category,
+    title: post.title,
+    author: post.author,
+    region: post.region,
+    views: post.views,
+    comments: post.comments,
+    likes: post.likes,
+    time: post.time,
+    tags: post.tags,
+    badge: post.badge,
+    accepted: post.accepted,
+    useful: post.useful,
+    me_too: post.meToo,
+  };
+}
+
+function normalizeIssue(row) {
+  return {
+    id: field(row, 'id') || Date.now(),
+    category: field(row, 'category') || '기타',
+    title: field(row, 'title') || '',
+    summary: field(row, 'summary') || '',
+    detail: field(row, 'detail') || '',
+    items: field(row, 'items') || '미지정',
+    impact: field(row, 'impact') || '분석 대기',
+    date: field(row, 'date', 'created_at') || '',
+    source: field(row, 'source') || '사용자 등록',
+    sourceUrl: field(row, 'sourceUrl', 'source_url') || 'https://www.sbiz.or.kr/',
+    imageUrl: field(row, 'imageUrl', 'image_url') || 'https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=1200&q=80',
+    ai: Boolean(field(row, 'ai')),
+  };
+}
+
+function issuePayload(issue) {
+  return {
+    category: issue.category,
+    title: issue.title,
+    summary: issue.summary,
+    detail: issue.detail,
+    items: issue.items,
+    impact: issue.impact,
+    date: issue.date,
+    source: issue.source,
+    source_url: issue.sourceUrl,
+    image_url: issue.imageUrl,
+    ai: issue.ai,
+  };
+}
+
 function App() {
   const [activePage, setActivePage] = useState('analysis');
-  const [events, setEvents] = useState(eventSeed);
-  const [communityPosts, setCommunityPosts] = useState(communitySeed);
-  const [issues, setIssues] = useState(issueSeed);
+  const [events, setEvents] = useState(() => (isSupabaseConfigured ? [] : eventSeed));
+  const [communityPosts, setCommunityPosts] = useState(() => (isSupabaseConfigured ? [] : communitySeed));
+  const [issues, setIssues] = useState(() => (isSupabaseConfigured ? [] : issueSeed));
   const [orders, setOrders] = useState([]);
   const [confirmItems, setConfirmItems] = useState([]);
   const [toast, setToast] = useState('');
   const [mockFail, setMockFail] = useState(false);
   const [supabaseItems, setSupabaseItems] = useState([]);
+  const [isOrderSaving, setIsOrderSaving] = useState(false);
 
   const items = useMemo(() => (supabaseItems.length ? supabaseItems : inventoryItems).map(enrichItem), [supabaseItems]);
-  const [cart, setCart] = useState(() => initialCartFromItems(inventoryItems.map(enrichItem)));
-  const [selectedIds, setSelectedIds] = useState(() => selectedIdsFromCart(initialCartFromItems(inventoryItems.map(enrichItem))));
+  const [cart, setCart] = useState({});
+  const [selectedIds, setSelectedIds] = useState([]);
 
   const cartItems = Object.values(cart);
   const selectedItems = cartItems.filter((item) => selectedIds.includes(item.id));
@@ -317,179 +463,238 @@ function App() {
   useEffect(() => {
     let active = true;
 
+    async function selectTable(table, normalize, applyRows, fallbackRows = []) {
+      try {
+        const { data, error } = await supabase.from(table).select('*');
+        if (!active) return [];
+        if (error) {
+          showToast(`Supabase ${table} 조회 오류: ${errorMessage(error)}`);
+          applyRows(fallbackRows);
+          return fallbackRows;
+        }
+        const rows = Array.isArray(data) ? data.map(normalize) : [];
+        applyRows(rows);
+        return rows;
+      } catch (error) {
+        if (active) showToast(`Supabase ${table} 연결 오류: ${errorMessage(error)}`);
+        applyRows(fallbackRows);
+        return fallbackRows;
+      }
+    }
+
     async function loadSupabaseData() {
       if (!isSupabaseConfigured) {
-        showToast('Supabase 설정이 없어 Mock Data로 표시합니다.');
+        showToast('DB 연결 안 됨 / 데모 모드로 표시합니다. 저장 내용은 새로고침 후 유지되지 않습니다.');
+        setCart({});
+        setSelectedIds([]);
         return;
       }
 
-      try {
-        const { data: inventoryRows, error: inventoryError } = await supabase.from('inventory_items').select('*');
-        if (!active) return;
+      const inventoryRows = await selectTable('inventory_items', normalizeInventoryItem, setSupabaseItems, inventoryItems);
+      if (!active) return;
 
-        let sourceItems = items;
-        if (inventoryError) {
-          showToast(`Supabase inventory_items 오류: ${errorMessage(inventoryError)}. Mock Data로 전환합니다.`);
-        } else if (Array.isArray(inventoryRows) && inventoryRows.length) {
-          const normalizedInventory = inventoryRows.map(normalizeInventoryItem);
-          setSupabaseItems(normalizedInventory);
-          sourceItems = normalizedInventory.map(enrichItem);
-        }
+      const sourceItems = (inventoryRows.length ? inventoryRows : inventoryItems).map(enrichItem);
+      const inventoryById = Object.fromEntries(sourceItems.map((item) => [item.id, item]));
 
-        const inventoryById = Object.fromEntries(sourceItems.map((item) => [item.id, item]));
-        const { data: cartRows, error: cartError } = await supabase.from('cart_items').select('*');
-        if (!active) return;
-
-        if (cartError) {
-          showToast(`Supabase cart_items 오류: ${errorMessage(cartError)}. Mock Data로 전환합니다.`);
-          return;
-        }
-
-        if (Array.isArray(cartRows) && cartRows.length) {
-          const nextCart = Object.fromEntries(cartRows.map((row) => {
-            const item = normalizeCartItem(row, inventoryById);
-            return [item.id, item];
-          }));
-          setCart(nextCart);
-          setSelectedIds(selectedIdsFromCart(nextCart));
-        }
-      } catch (error) {
-        if (active) showToast(`Supabase 연결 오류: ${errorMessage(error)}. Mock Data로 전환합니다.`);
-      }
+      await selectTable('cart_items', (row) => normalizeCartItem(row, inventoryById), (rows) => {
+        const nextCart = Object.fromEntries(rows.map((item) => [item.id, item]));
+        setCart(nextCart);
+        setSelectedIds(selectedIdsFromCart(nextCart));
+      });
+      await selectTable('orders', normalizeOrder, setOrders);
+      await selectTable('special_events', normalizeEvent, setEvents);
+      await selectTable('community_posts', normalizeCommunityPost, setCommunityPosts);
+      await selectTable('coffee_issues', normalizeIssue, setIssues);
     }
 
     loadSupabaseData();
     return () => { active = false; };
   }, []);
 
+  function requireDb(action) {
+    if (isSupabaseConfigured) return true;
+    showToast(`${action} 실패: DB 연결 안 됨 / 데모 모드입니다.`);
+    return false;
+  }
+
   async function insertCartItem(item) {
-    if (!isSupabaseConfigured) return true;
+    if (!requireDb('장바구니 추가')) return false;
     try {
-      const { error } = await supabase.from('cart_items').insert(cartPayload(item));
-      if (error) showToast(`장바구니 추가 오류: ${errorMessage(error)}. Mock Data로 유지합니다.`);
-      return !error;
+      const insertResult = await runWithSchemaFallback(
+        (payload) => supabase.from('cart_items').insert(payload),
+        cartPayload(item),
+      );
+      if (insertResult.ok) return true;
+
+      const isDuplicate = insertResult.error?.code === '23505' || errorMessage(insertResult.error).toLowerCase().includes('duplicate');
+      if (isDuplicate) {
+        const updateResult = await runWithSchemaFallback(
+          (payload) => supabase.from('cart_items').update(payload).eq('item_id', item.id),
+          insertResult.payload,
+        );
+        if (updateResult.error) showToast(`장바구니 중복 항목 수정 오류: ${errorMessage(updateResult.error)}`);
+        return updateResult.ok;
+      }
+
+      showToast(`장바구니 추가 오류: ${errorMessage(insertResult.error)}`);
+      return false;
     } catch (error) {
-      showToast(`장바구니 추가 오류: ${errorMessage(error)}. Mock Data로 유지합니다.`);
-      return true;
+      showToast(`장바구니 추가 오류: ${errorMessage(error)}`);
+      return false;
     }
   }
 
   async function updateCartItem(item) {
-    if (!isSupabaseConfigured) return true;
+    if (!requireDb('장바구니 수정')) return false;
     try {
-      const { error } = await supabase.from('cart_items').update(cartPayload(item)).eq('item_id', item.id);
-      if (error) showToast(`장바구니 수정 오류: ${errorMessage(error)}. Mock Data로 유지합니다.`);
-      return !error;
+      const updateResult = await runWithSchemaFallback(
+        (payload) => supabase.from('cart_items').update(payload).eq('item_id', item.id),
+        cartPayload(item),
+      );
+      if (updateResult.error) showToast(`장바구니 수정 오류: ${errorMessage(updateResult.error)}`);
+      return updateResult.ok;
     } catch (error) {
-      showToast(`장바구니 수정 오류: ${errorMessage(error)}. Mock Data로 유지합니다.`);
-      return true;
+      showToast(`장바구니 수정 오류: ${errorMessage(error)}`);
+      return false;
     }
   }
 
   async function deleteCartItems(itemIds) {
-    if (!isSupabaseConfigured) return true;
+    if (!requireDb('장바구니 삭제')) return false;
     try {
       const { error } = await supabase.from('cart_items').delete().in('item_id', itemIds);
-      if (error) showToast(`장바구니 삭제 오류: ${errorMessage(error)}. Mock Data로 유지합니다.`);
+      if (error) showToast(`장바구니 삭제 오류: ${errorMessage(error)}`);
       return !error;
     } catch (error) {
-      showToast(`장바구니 삭제 오류: ${errorMessage(error)}. Mock Data로 유지합니다.`);
-      return true;
+      showToast(`장바구니 삭제 오류: ${errorMessage(error)}`);
+      return false;
     }
   }
 
   async function addItemToCart(item) {
-    const nextItem = { ...item, status: 'draft' };
     const alreadyInCart = Boolean(cart[item.id]);
+    const nextItem = alreadyInCart
+      ? { ...cart[item.id], orderQty: Math.max(1, Number(cart[item.id].orderQty || 0) + Number(item.recommendedQty || 1)), status: 'draft' }
+      : { ...item, status: 'draft' };
+    const previousCart = cart;
+    const previousSelectedIds = selectedIds;
     setCart((prev) => ({ ...prev, [item.id]: nextItem }));
     setSelectedIds((prev) => (prev.includes(item.id) ? prev : [...prev, item.id]));
-    if (alreadyInCart) {
-      if (!(await updateCartItem(nextItem))) return;
-    } else {
-      if (!(await insertCartItem(nextItem))) return;
+    const saved = alreadyInCart ? await updateCartItem(nextItem) : await insertCartItem(nextItem);
+    if (!saved) {
+      setCart(previousCart);
+      setSelectedIds(previousSelectedIds);
+      return false;
     }
     showToast(`${item.name} 장바구니에 추가했습니다.`);
+    return true;
   }
+
   async function addAllRecommendations() {
-    const nextItems = recommended.map((item) => ({ ...item, status: 'draft' }));
-    setCart((prev) => {
-      const next = { ...prev };
-      nextItems.forEach((item) => { next[item.id] = item; });
-      return next;
+    const previousCart = cart;
+    const previousSelectedIds = selectedIds;
+    const nextItems = recommended.map((item) => {
+      const current = cart[item.id];
+      return current
+        ? { ...current, orderQty: Math.max(1, Number(current.orderQty || 0) + Number(item.recommendedQty || 1)), status: 'draft' }
+        : { ...item, status: 'draft' };
     });
+    const nextCart = { ...cart };
+    nextItems.forEach((item) => { nextCart[item.id] = item; });
+    setCart(nextCart);
     setSelectedIds((prev) => Array.from(new Set([...prev, ...recommended.map((item) => item.id)])));
-    const results = await Promise.all(nextItems.map((item) => (cart[item.id] ? updateCartItem(item) : insertCartItem(item))));
-    if (results.every(Boolean)) showToast('추천 항목을 장바구니에 추가했습니다.');
+    const results = await Promise.all(nextItems.map((item) => (previousCart[item.id] ? updateCartItem(item) : insertCartItem(item))));
+    if (!results.every(Boolean)) {
+      setCart(previousCart);
+      setSelectedIds(previousSelectedIds);
+      return;
+    }
+    showToast('추천 항목을 장바구니에 추가했습니다.');
   }
+
   async function updateCartQty(itemId, orderQty) {
     const nextQty = Math.max(1, Number(orderQty) || 1);
+    const previousCart = cart;
     const nextItem = cart[itemId] ? { ...cart[itemId], orderQty: nextQty } : null;
     setCart((prev) => (!prev[itemId] ? prev : { ...prev, [itemId]: { ...prev[itemId], orderQty: nextQty } }));
-    if (nextItem) await updateCartItem(nextItem);
+    if (nextItem && !(await updateCartItem(nextItem))) setCart(previousCart);
   }
+
   async function removeCartItem(itemId) {
+    const previousCart = cart;
+    const previousSelectedIds = selectedIds;
     setCart((prev) => {
       const next = { ...prev };
       delete next[itemId];
       return next;
     });
     setSelectedIds((prev) => prev.filter((id) => id !== itemId));
-    if (await deleteCartItems([itemId])) showToast('장바구니에서 삭제했습니다.');
+    if (await deleteCartItems([itemId])) {
+      showToast('장바구니에서 삭제했습니다.');
+      return;
+    }
+    setCart(previousCart);
+    setSelectedIds(previousSelectedIds);
   }
+
   function openOrderConfirm(itemsToOrder) {
     if (!itemsToOrder.length) {
       showToast('발주할 품목을 선택해 주세요.');
       return;
     }
-    setCart((prev) => {
-      const next = { ...prev };
-      itemsToOrder.forEach((item) => {
-        if (next[item.id]) next[item.id] = { ...next[item.id], status: 'pending' };
-      });
-      return next;
-    });
     setConfirmItems(itemsToOrder);
   }
 
-  function startImmediateOrder(item) {
-    const orderItem = cart[item.id] || { ...item, status: 'draft' };
-    addItemToCart(item);
-    setConfirmItems([orderItem]);
+  async function startImmediateOrder(item) {
+    const current = cart[item.id];
+    const orderItem = current
+      ? { ...current, orderQty: Math.max(1, Number(current.orderQty || 0) + Number(item.recommendedQty || 1)), status: 'draft' }
+      : { ...item, status: 'draft' };
+    if (await addItemToCart(item)) setConfirmItems([orderItem]);
   }
 
   async function createSupabaseOrder(order) {
-    if (!isSupabaseConfigured) return true;
+    if (!requireDb('발주 저장')) return false;
 
+    let orderId = null;
     try {
-      const { data: orderRows, error: orderError } = await supabase.from('orders').insert(orderPayload(order)).select('id');
+      const { data: orderRows, error: orderError } = await supabase.from('orders').insert(orderPayload(order)).select('id, order_number');
       if (orderError) {
-        showToast(`발주 저장 오류: ${errorMessage(orderError)}. Mock Data로 저장합니다.`);
-        return true;
+        showToast(`발주 저장 오류: ${errorMessage(orderError)}`);
+        return false;
       }
 
-      const orderId = orderRows?.[0]?.id || order.orderNumber;
+      orderId = orderRows?.[0]?.id || null;
+      const orderKey = orderId || order.orderNumber;
       const { error: itemError } = await supabase
         .from('order_items')
-        .insert(order.items.map((item) => orderItemPayload(orderId, order.orderNumber, item)));
+        .insert(order.items.map((item) => orderItemPayload(orderKey, order.orderNumber, item)));
 
       if (itemError) {
-        showToast(`발주 품목 저장 오류: ${errorMessage(itemError)}. Mock Data로 저장합니다.`);
-        return true;
+        if (orderId) await supabase.from('orders').delete().eq('id', orderId);
+        else await supabase.from('orders').delete().eq('order_number', order.orderNumber);
+        showToast(`발주 품목 저장 오류: ${errorMessage(itemError)}`);
+        return false;
       }
 
-      return deleteCartItems(order.items.map((item) => item.id));
-    } catch (error) {
-      showToast(`발주 저장 오류: ${errorMessage(error)}. Mock Data로 저장합니다.`);
+      const cartDeleted = await deleteCartItems(order.items.map((item) => item.id));
+      if (!cartDeleted) return false;
       return true;
+    } catch (error) {
+      if (orderId) await supabase.from('orders').delete().eq('id', orderId);
+      showToast(`발주 저장 오류: ${errorMessage(error)}`);
+      return false;
     }
   }
 
   async function confirmOrder() {
+    if (isOrderSaving) return;
     if (mockFail) {
       showToast('발주 실패 mock 상태입니다.');
       setConfirmItems([]);
       return;
     }
+    setIsOrderSaving(true);
     const order = {
       orderNumber: makeOrderNumber(),
       createdAt: new Date().toLocaleString('ko-KR'),
@@ -500,6 +705,7 @@ function App() {
       items: confirmItems,
     };
     const saved = await createSupabaseOrder(order);
+    setIsOrderSaving(false);
     if (!saved) return;
 
     setOrders((prev) => [order, ...prev]);
@@ -513,10 +719,158 @@ function App() {
     showToast('발주가 완료되었습니다.');
   }
 
+  async function insertEvent(event) {
+    if (!requireDb('특이사항 저장')) return false;
+    try {
+      const { data, error } = await supabase.from('special_events').insert(eventPayload(event)).select('*');
+      if (error) {
+        showToast(`특이사항 저장 오류: ${errorMessage(error)}`);
+        return false;
+      }
+      setEvents((prev) => [normalizeEvent(data?.[0] || event), ...prev]);
+      return true;
+    } catch (error) {
+      showToast(`특이사항 저장 오류: ${errorMessage(error)}`);
+      return false;
+    }
+  }
+
+  async function deleteEvent(eventId) {
+    if (!requireDb('특이사항 삭제')) return false;
+    const previous = events;
+    setEvents((prev) => prev.filter((event) => event.id !== eventId));
+    try {
+      const { error } = await supabase.from('special_events').delete().eq('id', eventId);
+      if (error) {
+        setEvents(previous);
+        showToast(`특이사항 삭제 오류: ${errorMessage(error)}`);
+        return false;
+      }
+      showToast('특이사항을 삭제했습니다.');
+      return true;
+    } catch (error) {
+      setEvents(previous);
+      showToast(`특이사항 삭제 오류: ${errorMessage(error)}`);
+      return false;
+    }
+  }
+
+  async function insertCommunityPost() {
+    if (!requireDb('게시글 저장')) return false;
+    const post = { id: Date.now(), category: '발주 고민', title: '새 게시글', author: '익산 사장님', region: '익산', views: 0, comments: 0, likes: 0, time: '방금 전', tags: [], badge: '익산 사장님', accepted: false, useful: 0, meToo: 0 };
+    try {
+      const { data, error } = await supabase.from('community_posts').insert(communityPayload(post)).select('*');
+      if (error) {
+        showToast(`게시글 저장 오류: ${errorMessage(error)}`);
+        return false;
+      }
+      setCommunityPosts((prev) => [normalizeCommunityPost(data?.[0] || post), ...prev]);
+      showToast('게시글이 저장되었습니다.');
+      return true;
+    } catch (error) {
+      showToast(`게시글 저장 오류: ${errorMessage(error)}`);
+      return false;
+    }
+  }
+
+  async function updateCommunityPost(post) {
+    if (!requireDb('게시글 수정')) return false;
+    const previous = communityPosts;
+    setCommunityPosts((prev) => prev.map((item) => (item.id === post.id ? post : item)));
+    try {
+      const { error } = await supabase.from('community_posts').update(communityPayload(post)).eq('id', post.id);
+      if (error) {
+        setCommunityPosts(previous);
+        showToast(`게시글 수정 오류: ${errorMessage(error)}`);
+        return false;
+      }
+      return true;
+    } catch (error) {
+      setCommunityPosts(previous);
+      showToast(`게시글 수정 오류: ${errorMessage(error)}`);
+      return false;
+    }
+  }
+
+  async function deleteCommunityPost(postId) {
+    if (!requireDb('게시글 삭제')) return false;
+    const previous = communityPosts;
+    setCommunityPosts((prev) => prev.filter((post) => post.id !== postId));
+    try {
+      const { error } = await supabase.from('community_posts').delete().eq('id', postId);
+      if (error) {
+        setCommunityPosts(previous);
+        showToast(`게시글 삭제 오류: ${errorMessage(error)}`);
+        return false;
+      }
+      showToast('게시글을 삭제했습니다.');
+      return true;
+    } catch (error) {
+      setCommunityPosts(previous);
+      showToast(`게시글 삭제 오류: ${errorMessage(error)}`);
+      return false;
+    }
+  }
+
+  async function insertIssue(issue) {
+    if (!requireDb('커피 이슈 저장')) return false;
+    try {
+      const { data, error } = await supabase.from('coffee_issues').insert(issuePayload(issue)).select('*');
+      if (error) {
+        showToast(`커피 이슈 저장 오류: ${errorMessage(error)}`);
+        return false;
+      }
+      setIssues((prev) => [normalizeIssue(data?.[0] || issue), ...prev]);
+      return true;
+    } catch (error) {
+      showToast(`커피 이슈 저장 오류: ${errorMessage(error)}`);
+      return false;
+    }
+  }
+
+  async function updateIssue(issue) {
+    if (!requireDb('커피 이슈 수정')) return false;
+    const previous = issues;
+    setIssues((prev) => prev.map((item) => (item.id === issue.id ? issue : item)));
+    try {
+      const { error } = await supabase.from('coffee_issues').update(issuePayload(issue)).eq('id', issue.id);
+      if (error) {
+        setIssues(previous);
+        showToast(`커피 이슈 수정 오류: ${errorMessage(error)}`);
+        return false;
+      }
+      return true;
+    } catch (error) {
+      setIssues(previous);
+      showToast(`커피 이슈 수정 오류: ${errorMessage(error)}`);
+      return false;
+    }
+  }
+
+  async function deleteIssue(issueId) {
+    if (!requireDb('커피 이슈 삭제')) return false;
+    const previous = issues;
+    setIssues((prev) => prev.filter((issue) => issue.id !== issueId));
+    try {
+      const { error } = await supabase.from('coffee_issues').delete().eq('id', issueId);
+      if (error) {
+        setIssues(previous);
+        showToast(`커피 이슈 삭제 오류: ${errorMessage(error)}`);
+        return false;
+      }
+      showToast('커피 이슈를 삭제했습니다.');
+      return true;
+    } catch (error) {
+      setIssues(previous);
+      showToast(`커피 이슈 삭제 오류: ${errorMessage(error)}`);
+      return false;
+    }
+  }
   return (
     <div className="app">
       <Sidebar activePage={activePage} setActivePage={setActivePage} />
       <main className="content">
+        {!isSupabaseConfigured && <section className="riskBanner"><AlertTriangle size={20} /><strong>DB 연결 안 됨 / 데모 모드</strong><span>Supabase 환경변수를 확인해 주세요. 저장 데이터는 새로고침 후 유지되지 않습니다.</span></section>}
         <RiskBanner riskItems={riskItems} />
         <Header activePage={activePage} cartCount={cartItems.length} />
 
@@ -527,14 +881,14 @@ function App() {
         {activePage === 'history' && <OrderHistoryPage orders={orders} />}
         {activePage === 'inventory' && <InventoryPage items={items} addItemToCart={addItemToCart} startImmediateOrder={startImmediateOrder} />}
         {activePage === 'products' && <ProductsPage />}
-        {activePage === 'events' && <EventsPage events={events} setEvents={setEvents} showToast={showToast} />}
-        {activePage === 'community' && <CommunityPage posts={communityPosts} setPosts={setCommunityPosts} showToast={showToast} />}
-        {activePage === 'issues' && <IssuesPage issues={issues} setIssues={setIssues} showToast={showToast} />}
+        {activePage === 'events' && <EventsPage events={events} insertEvent={insertEvent} deleteEvent={deleteEvent} showToast={showToast} />}
+        {activePage === 'community' && <CommunityPage posts={communityPosts} insertCommunityPost={insertCommunityPost} updateCommunityPost={updateCommunityPost} deleteCommunityPost={deleteCommunityPost} showToast={showToast} />}
+        {activePage === 'issues' && <IssuesPage issues={issues} insertIssue={insertIssue} updateIssue={updateIssue} deleteIssue={deleteIssue} showToast={showToast} />}
         {activePage === 'reports' && <ReportPage addAllRecommendations={addAllRecommendations} setActivePage={setActivePage} />}
         {activePage === 'settings' && <SettingsPage mockFail={mockFail} setMockFail={setMockFail} />}
       </main>
 
-      {!!confirmItems.length && <OrderConfirmModal items={confirmItems} onCancel={() => setConfirmItems([])} onConfirm={confirmOrder} />}
+      {!!confirmItems.length && <OrderConfirmModal items={confirmItems} onCancel={() => setConfirmItems([])} onConfirm={confirmOrder} isSaving={isOrderSaving} />}
       {toast && <div className="toast">{toast}</div>}
     </div>
   );
@@ -689,6 +1043,7 @@ function RecommendationCards({ items, addItemToCart, startImmediateOrder }) {
 
 function SimilarEvent({ events }) {
   const event = events[1] || events[0];
+  if (!event) return <p className="empty">등록된 특이사항이 없습니다.</p>;
   return <div className="similarEvent"><b>{event.date} · {event.title}</b><p>{event.salesChange} 사례가 있어 오늘도 비슷한 패턴이 예상됩니다.</p><strong>권장 발주량 +8%</strong></div>;
 }
 
@@ -770,7 +1125,7 @@ function CartOrderPanel({ cartItems, selectedIds, setSelectedIds, selectedItems,
   );
 }
 
-function OrderConfirmModal({ items, onCancel, onConfirm }) {
+function OrderConfirmModal({ items, onCancel, onConfirm, isSaving }) {
   const totalAmount = items.reduce((sum, item) => sum + item.orderQty * item.unitCost, 0);
   const suppliers = Array.from(new Set(items.map((item) => item.supplier))).join(', ');
   return (
@@ -780,15 +1135,14 @@ function OrderConfirmModal({ items, onCancel, onConfirm }) {
         <div className="modalSummary"><span>총 품목 <b>{items.length}개</b></span><span>총 금액 <b>{currency(totalAmount)}</b></span><span>공급사 <b>{suppliers}</b></span><span>예상 배송일 <b>{items[0]?.expectedDeliveryDate || '-'}</b></span></div>
         <div className="modalItems">{items.map((item) => <div key={item.id}><strong>{item.name}</strong><span>{numberFormat(item.orderQty)}{item.unit} · {currency(item.orderQty * item.unitCost)}</span></div>)}</div>
         <p className="warningText">확정 시 주문번호가 생성되고 발주 내역에 저장되며 장바구니에서 제거됩니다.</p>
-        <div className="modalActions"><button className="subtleButton" onClick={onCancel}>취소</button><button onClick={onConfirm}>발주 확정</button></div>
+        <div className="modalActions"><button className="subtleButton" onClick={onCancel} disabled={isSaving}>취소</button><button onClick={onConfirm} disabled={isSaving}>{isSaving ? '저장 중' : '발주 확정'}</button></div>
       </section>
     </div>
   );
 }
 
 function OrderHistoryPage({ orders }) {
-  const rows = orders.length ? orders : [{ orderNumber: 'PO-260704-1024', createdAt: '2026.07.04 10:21', itemCount: 3, totalAmount: 84600, supplier: '서울 데일리팜 외 2', status: 'ordered', items: [] }, { orderNumber: 'PO-260703-8842', createdAt: '2026.07.03 18:04', itemCount: 2, totalAmount: 27600, supplier: '카페 사장마켓', status: 'pending', items: [] }];
-  return <Card title="발주 내역"><DataTable rows={rows} columns={[['orderNumber', '주문번호'], ['createdAt', '발주일'], ['itemCount', '품목 수'], ['totalAmount', '금액', currency], ['supplier', '공급사'], ['status', '상태']]} action={(row) => alert(`${row.orderNumber}\n${row.supplier}\n${currency(row.totalAmount)}`)} /></Card>;
+  return <Card title="발주 내역"><DataTable rows={orders} columns={[['orderNumber', '주문번호'], ['createdAt', '발주일'], ['itemCount', '품목 수'], ['totalAmount', '금액', currency], ['supplier', '공급사'], ['status', '상태']]} action={(row) => alert(`${row.orderNumber}\n${row.supplier}\n${currency(row.totalAmount)}`)} /></Card>;
 }
 
 function InventoryPage({ items, addItemToCart, startImmediateOrder }) {
@@ -809,44 +1163,50 @@ function ProductsPage() {
   );
 }
 
-function EventsPage({ events, setEvents, showToast }) {
+function EventsPage({ events, insertEvent, deleteEvent, showToast }) {
   const [form, setForm] = useState({ title: '', type: '지역행사', region: '익산' });
-  function addEvent() {
+  const [isSaving, setIsSaving] = useState(false);
+  async function addEvent() {
     if (!form.title.trim()) return showToast('제목을 입력해 주세요.');
-    setEvents((prev) => [{ id: Date.now(), date: new Date().toLocaleDateString('ko-KR'), store: '카페362 익산점', visitors: '미정', salesChange: '분석 대기', volumeChange: '분석 대기', items: '미지정', memo: '운영자 등록', image: '없음', ai: true, ...form }, ...prev]);
+    setIsSaving(true);
+    const saved = await insertEvent({ id: Date.now(), date: new Date().toLocaleDateString('ko-KR'), store: '카페362 익산점', visitors: '미정', salesChange: '분석 대기', volumeChange: '분석 대기', items: '미지정', memo: '운영자 등록', image: '없음', ai: true, ...form });
+    setIsSaving(false);
+    if (!saved) return;
     setForm({ title: '', type: '지역행사', region: '익산' });
     showToast('특이사항이 저장되었습니다.');
   }
-  return <CrudPage title="특이사항 아카이브" rows={events} setRows={setEvents} form={form} setForm={setForm} addRow={addEvent} categories={['전체', '선거', '공공기관 방문', '방송촬영', '지역행사']} columns={[['date', '날짜'], ['title', '제목'], ['type', '유형'], ['region', '지역'], ['store', '관련 매장'], ['visitors', '예상 방문객'], ['salesChange', '실제 매출 변화'], ['volumeChange', '판매량 변화'], ['items', '관련 품목'], ['ai', 'AI 반영', (v) => (v ? '반영' : '미반영')]]} />;
+  return <CrudPage title="특이사항 아카이브" rows={events} form={form} setForm={setForm} addRow={addEvent} deleteRow={deleteEvent} isSaving={isSaving} categories={['전체', '선거', '공공기관 방문', '방송촬영', '지역행사']} columns={[['date', '날짜'], ['title', '제목'], ['type', '유형'], ['region', '지역'], ['store', '관련 매장'], ['visitors', '예상 방문객'], ['salesChange', '실제 매출 변화'], ['volumeChange', '판매량 변화'], ['items', '관련 품목'], ['ai', 'AI 반영', (v) => (v ? '반영' : '미반영')]]} />;
 }
 
-function CommunityPage({ posts, setPosts, showToast }) {
-  function react(id, key) {
-    setPosts((prev) => prev.map((post) => (post.id === id ? { ...post, [key]: post[key] + 1 } : post)));
+function CommunityPage({ posts, insertCommunityPost, updateCommunityPost, deleteCommunityPost }) {
+  async function react(row, key) {
+    await updateCommunityPost({ ...row, [key]: Number(row[key] || 0) + 1 });
   }
+  const maxComments = posts.length ? Math.max(...posts.map((post) => post.comments)) : 0;
   return (
     <>
       <section className="communityHighlights">
         <Metric label="오늘 인기글" value={posts[0]?.likes || 0} detail={posts[0]?.title} />
-        <Metric label="댓글 많은 글" value={Math.max(...posts.map((post) => post.comments))} />
+        <Metric label="댓글 많은 글" value={maxComments} />
         <Metric label="우리지역 게시글" value={`${posts.filter((post) => post.region === '익산').length}건`} />
         <Metric label="이번주 추천글" value="12건" />
       </section>
-      <Card title="사장님 커뮤니티" action={<button onClick={() => showToast('게시글 작성 모달 mock입니다.')}>글쓰기</button>}>
-        <DataTable rows={posts} columns={[['category', '카테고리'], ['title', '제목'], ['author', '작성자'], ['region', '지역'], ['views', '조회'], ['comments', '댓글'], ['likes', '좋아요'], ['time', '작성시간'], ['badge', '뱃지']]} action={(row) => <div className="tableActions"><button onClick={() => react(row.id, 'likes')}>좋아요</button><button className="subtleButton" onClick={() => react(row.id, 'useful')}>유용해요</button><button className="subtleButton" onClick={() => react(row.id, 'meToo')}>나도 겪었어요</button></div>} />
+      <Card title="사장님 커뮤니티" action={<button onClick={insertCommunityPost}>글쓰기</button>}>
+        <DataTable rows={posts} columns={[['category', '카테고리'], ['title', '제목'], ['author', '작성자'], ['region', '지역'], ['views', '조회'], ['comments', '댓글'], ['likes', '좋아요'], ['time', '작성시간'], ['badge', '뱃지']]} action={(row) => <div className="tableActions"><button onClick={() => react(row, 'likes')}>좋아요</button><button className="subtleButton" onClick={() => react(row, 'useful')}>유용해요</button><button className="subtleButton" onClick={() => react(row, 'meToo')}>나도 겪었어요</button><button className="subtleButton" onClick={() => deleteCommunityPost(row.id)}>삭제</button></div>} />
       </Card>
     </>
   );
 }
-
-function IssuesPage({ issues, setIssues, showToast }) {
+function IssuesPage({ issues, insertIssue, updateIssue, deleteIssue, showToast }) {
   const [form, setForm] = useState({ title: '', category: '원두 가격', impact: '분석 대기' });
   const [selectedIssueId, setSelectedIssueId] = useState(null);
+  const [isSaving, setIsSaving] = useState(false);
   const selectedIssue = issues.find((issue) => issue.id === selectedIssueId);
 
-  function addIssue() {
+  async function addIssue() {
     if (!form.title.trim()) return showToast('제목을 입력해 주세요.');
-    setIssues((prev) => [{
+    setIsSaving(true);
+    const saved = await insertIssue({
       id: Date.now(),
       date: new Date().toLocaleDateString('ko-KR'),
       summary: '사용자 등록 이슈입니다. 향후 뉴스/API 자동 수집 구조로 확장됩니다.',
@@ -857,14 +1217,16 @@ function IssuesPage({ issues, setIssues, showToast }) {
       imageUrl: 'https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=1200&q=80',
       ai: false,
       ...form,
-    }, ...prev]);
+    });
+    setIsSaving(false);
+    if (!saved) return;
     setForm({ title: '', category: '원두 가격', impact: '분석 대기' });
     showToast('커피 이슈가 등록되었습니다.');
   }
 
-  function toggleAiReflect(issueId) {
-    setIssues((prev) => prev.map((issue) => (issue.id === issueId ? { ...issue, ai: !issue.ai } : issue)));
-    showToast('AI 반영 상태가 변경되었습니다.');
+  async function toggleAiReflect(issue) {
+    const saved = await updateIssue({ ...issue, ai: !issue.ai });
+    if (saved) showToast('AI 반영 상태가 변경되었습니다.');
   }
 
   if (selectedIssue) {
@@ -872,7 +1234,7 @@ function IssuesPage({ issues, setIssues, showToast }) {
       <IssueDetail
         issue={selectedIssue}
         onBack={() => setSelectedIssueId(null)}
-        onToggleAi={() => toggleAiReflect(selectedIssue.id)}
+        onToggleAi={() => toggleAiReflect(selectedIssue)}
       />
     );
   }
@@ -884,7 +1246,7 @@ function IssuesPage({ issues, setIssues, showToast }) {
           <input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="제목" />
           <select value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })}>{['원두 가격', '우유', '식자재', '카페 트렌드', '소상공인 정책', '기상', '지역 행사', '프랜차이즈', '기타'].map((item) => <option key={item}>{item}</option>)}</select>
           <input value={form.impact} onChange={(event) => setForm({ ...form, impact: event.target.value })} placeholder="예상 영향" />
-          <button onClick={addIssue}><Plus size={16} /> 등록</button>
+          <button onClick={addIssue} disabled={isSaving}><Plus size={16} /> 등록</button>
         </div>
       </Card>
       <Card title="커피 이슈">
@@ -892,13 +1254,12 @@ function IssuesPage({ issues, setIssues, showToast }) {
           rows={issues}
           columns={[['category', '카테고리'], ['title', '제목', (value, row) => <button className="linkButton" onClick={() => setSelectedIssueId(row.id)}>{value}</button>], ['summary', '요약'], ['items', '관련 품목'], ['impact', '예상 영향'], ['date', '작성일'], ['source', '출처'], ['ai', 'AI 반영', (v) => (v ? '반영' : '미반영')]]}
           categories={['전체', '원두 가격', '우유', '식자재', '카페 트렌드', '소상공인 정책', '기상', '지역 행사', '프랜차이즈', '기타']}
-          action={(row) => <button onClick={() => setSelectedIssueId(row.id)}>상세보기</button>}
+          action={(row) => <div className="tableActions"><button onClick={() => setSelectedIssueId(row.id)}>상세보기</button><button className="subtleButton" onClick={() => deleteIssue(row.id)}>삭제</button></div>}
         />
       </Card>
     </>
   );
 }
-
 function IssueDetail({ issue, onBack, onToggleAi }) {
   return (
     <section className="issueDetail">
@@ -930,7 +1291,7 @@ function IssueDetail({ issue, onBack, onToggleAi }) {
   );
 }
 
-function CrudPage({ title, rows, setRows, form, setForm, addRow, categories, columns }) {
+function CrudPage({ title, rows, form, setForm, addRow, deleteRow, isSaving, categories, columns }) {
   return (
     <>
       <Card title={`${title} 등록`}>
@@ -938,16 +1299,15 @@ function CrudPage({ title, rows, setRows, form, setForm, addRow, categories, col
           <input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="제목" />
           <select value={form.type || form.category} onChange={(event) => setForm({ ...form, [form.type !== undefined ? 'type' : 'category']: event.target.value })}>{categories.filter((item) => item !== '전체').map((item) => <option key={item}>{item}</option>)}</select>
           <input value={form.region || form.impact} onChange={(event) => setForm({ ...form, [form.region !== undefined ? 'region' : 'impact']: event.target.value })} placeholder={form.region !== undefined ? '지역' : '예상 영향'} />
-          <button onClick={addRow}><Plus size={16} /> 등록</button>
+          <button onClick={addRow} disabled={isSaving}><Plus size={16} /> 등록</button>
         </div>
       </Card>
       <Card title={title}>
-        <DataTable rows={rows} columns={columns} categories={categories} action={(row) => <button className="subtleButton" onClick={() => setRows(rows.filter((item) => item.id !== row.id))}>삭제</button>} />
+        <DataTable rows={rows} columns={columns} categories={categories} action={(row) => <button className="subtleButton" onClick={() => deleteRow(row.id)}>삭제</button>} />
       </Card>
     </>
   );
 }
-
 function DataTable({ rows, columns, categories, action }) {
   const filter = useFilteredRows(rows);
   const availableCategories = categories || ['전체', ...Array.from(new Set(rows.map((row) => row.category || row.type || row.status).filter(Boolean)))];
