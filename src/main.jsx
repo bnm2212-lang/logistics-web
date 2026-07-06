@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   AlertTriangle,
@@ -27,6 +27,8 @@ import {
 } from 'lucide-react';
 import './styles.css';
 import { isSupabaseConfigured, supabase } from './lib/supabase';
+
+const shownToastKeys = new Set();
 
 const inventoryItems = [
   { id: 'MILK-01', name: '우유', category: '유제품', supplier: '서울 데일리팜', currentStock: 10, requiredStock: 34, unit: 'L', unitCost: 2600, psi: 37, dailySalesChange: 22, weeklyConsumption: 126, forecastSales: 52, actualSales: 44, stockoutHours: 7, leadTimeHours: 18, reason: '토요일, 비 예보, 관광객 증가 사례가 겹쳐 라떼류 수요가 커집니다.' },
@@ -224,27 +226,36 @@ function normalizeInventoryItem(row) {
   };
 }
 
-function cartPayload(item) {
+function inventoryPayload(item) {
   return {
-    item_id: item.id,
     name: item.name,
     category: item.category,
-    supplier: item.supplier,
     current_stock: item.currentStock,
-    required_stock: item.requiredStock,
     unit: item.unit,
-    unit_cost: item.unitCost,
-    psi: item.psi,
-    order_qty: item.orderQty,
-    status: item.status || 'draft',
+    supplier: item.supplier,
+  };
+}
+
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || ''));
+}
+function itemReferenceValue(item) {
+  return field(item, 'inventoryId', 'inventory_id', 'inventoryItemId', 'inventory_item_id', 'productId', 'product_id', 'id');
+}
+
+function cartPayload(item) {
+  const itemRef = itemReferenceValue(item);
+  const quantity = Math.max(1, Number(item.orderQty || item.quantity || 1));
+  return {
+    inventory_item_id: itemRef,
+    quantity,
+    supplier: item.supplier,
   };
 }
 
 function orderPayload(order) {
   return {
     order_number: order.orderNumber,
-    created_at: new Date().toISOString(),
-    item_count: order.itemCount,
     total_amount: order.totalAmount,
     supplier: order.supplier,
     status: order.status,
@@ -252,30 +263,56 @@ function orderPayload(order) {
 }
 
 function orderItemPayload(orderId, orderNumber, item) {
+  const itemRef = itemReferenceValue(item);
+  const quantity = Math.max(1, Number(item.orderQty || item.quantity || 1));
   return {
     order_id: orderId,
-    order_number: orderNumber,
-    item_id: item.id,
-    name: item.name,
-    supplier: item.supplier,
-    unit: item.unit,
-    unit_cost: item.unitCost,
-    order_qty: item.orderQty,
-    total_amount: item.orderQty * item.unitCost,
-    status: item.status || 'ordered',
+    inventory_item_id: itemRef,
+    quantity,
   };
 }
 
 function normalizeCartItem(row, inventoryById) {
-  const itemId = String(field(row, 'item_id', 'id') || '');
-  const base = inventoryById[itemId] || normalizeInventoryItem({ ...row, id: itemId });
+  const itemRef = String(field(row, 'inventory_id', 'inventory_item_id', 'product_id', 'item_id', 'sku', 'code') || '');
+  const name = field(row, 'name', 'item_name', 'product_name') || '';
+  const matchedByName = Object.values(inventoryById).find((item) => item.name === name);
+  const itemId = itemRef || matchedByName?.id || String(field(row, 'id') || '');
+  const base = inventoryById[itemId] || matchedByName || normalizeInventoryItem({ ...row, id: itemId });
   return {
     ...base,
+    inventoryId: field(row, 'inventory_id'),
+    inventoryItemId: field(row, 'inventory_item_id'),
+    productId: field(row, 'product_id'),
+    orderNumber: field(row, 'order_number'),
     orderQty: numberField(row, base.orderQty || base.recommendedQty || 1, 'orderQty', 'order_qty', 'quantity'),
     status: field(row, 'status') || 'draft',
   };
 }
 
+function mergeInventoryItems(baseItems, dbItems) {
+  const mergedByName = new Map(baseItems.map((item) => [item.name, enrichItem(item)]));
+  dbItems.map(enrichItem).forEach((item) => {
+    const base = mergedByName.get(item.name);
+    if (!base) {
+      mergedByName.set(item.name || item.id, item);
+      return;
+    }
+
+    mergedByName.set(item.name, enrichItem({
+      ...base,
+      ...item,
+      category: item.category || base.category,
+      supplier: item.supplier || base.supplier,
+      currentStock: item.currentStock || base.currentStock,
+      requiredStock: item.requiredStock || base.requiredStock,
+      unit: item.unit || base.unit,
+      unitCost: item.unitCost || base.unitCost,
+      psi: item.psi === 50 && base.psi !== 50 ? base.psi : item.psi,
+      reason: item.reason || base.reason,
+    }));
+  });
+  return Array.from(mergedByName.values());
+}
 function initialCartFromItems(items) {
   return Object.fromEntries(items.filter((item) => item.shortage > 0).map((item) => [item.id, item]));
 }
@@ -301,9 +338,9 @@ function omitPayloadColumn(payload, column) {
 
 async function runWithSchemaFallback(makeRequest, payload) {
   let nextPayload = { ...payload };
-  for (let attempt = 0; attempt < 12; attempt += 1) {
+  for (let attempt = 0; attempt < 32; attempt += 1) {
     const result = await makeRequest(nextPayload);
-    if (!result.error) return { ok: true, payload: nextPayload };
+    if (!result.error) return { ok: true, payload: nextPayload, data: result.data };
 
     const column = missingSchemaColumn(result.error);
     if (!column || nextPayload[column] === undefined) {
@@ -313,6 +350,58 @@ async function runWithSchemaFallback(makeRequest, payload) {
     nextPayload = omitPayloadColumn(nextPayload, column);
   }
   return { ok: false, error: { message: 'cart_items 컬럼 자동 조정 횟수를 초과했습니다.' }, payload: nextPayload };
+}
+
+function isMissingColumnError(error) {
+  const message = errorMessage(error);
+  return error?.code === '42703' || message.includes('does not exist') || message.includes('Could not find');
+}
+
+async function runCartItemFilterRequest(makeRequest, item, actionLabel) {
+  const itemRef = itemReferenceValue(item);
+  const candidates = [
+    ['inventory_item_id', itemRef],
+    ['inventory_id', itemRef],
+    ['product_id', itemRef],
+    ['item_id', itemRef],
+    ['sku', itemRef],
+    ['code', itemRef],
+    ['name', field(item, 'name')],
+    ['id', itemRef],
+  ];
+  let lastError = null;
+  for (const [column, value] of candidates) {
+    if (!value) continue;
+    const { error } = await makeRequest(column, value);
+    if (!error) return true;
+    lastError = error;
+    if (!isMissingColumnError(error)) break;
+  }
+  return { error: lastError || { message: `${actionLabel} 대상 컬럼을 찾지 못했습니다.` } };
+}
+
+async function runCartItemsFilterRequest(makeRequest, items, actionLabel) {
+  const refs = items.map((item) => (typeof item === 'string' ? item : itemReferenceValue(item))).filter(Boolean);
+  const names = items.map((item) => (typeof item === 'string' ? '' : field(item, 'name'))).filter(Boolean);
+  const candidates = [
+    ['inventory_item_id', refs],
+    ['inventory_id', refs],
+    ['product_id', refs],
+    ['item_id', refs],
+    ['sku', refs],
+    ['code', refs],
+    ['name', names],
+    ['id', refs],
+  ];
+  let lastError = null;
+  for (const [column, values] of candidates) {
+    if (!values.length) continue;
+    const { error } = await makeRequest(column, values);
+    if (!error) return true;
+    lastError = error;
+    if (!isMissingColumnError(error)) break;
+  }
+  return { error: lastError || { message: `${actionLabel} 대상 컬럼을 찾지 못했습니다.` } };
 }
 
 function normalizeOrder(row) {
@@ -331,9 +420,9 @@ function normalizeOrder(row) {
 function normalizeEvent(row) {
   return {
     id: field(row, 'id') || Date.now(),
-    date: field(row, 'date', 'created_at') || '',
+    date: field(row, 'date', 'event_date', 'created_at') || '',
     title: field(row, 'title') || '',
-    type: field(row, 'type', 'category') || '지역행사',
+    type: field(row, 'type', 'event_type', 'category') || '지역행사',
     region: field(row, 'region') || '익산',
     store: field(row, 'store') || '카페362 익산점',
     visitors: field(row, 'visitors') || '미정',
@@ -348,18 +437,9 @@ function normalizeEvent(row) {
 
 function eventPayload(event) {
   return {
-    date: event.date,
     title: event.title,
-    type: event.type,
     region: event.region,
-    store: event.store,
-    visitors: event.visitors,
-    sales_change: event.salesChange,
-    volume_change: event.volumeChange,
-    items: event.items,
     memo: event.memo,
-    image: event.image,
-    ai: event.ai,
   };
 }
 
@@ -368,7 +448,7 @@ function normalizeCommunityPost(row) {
     id: field(row, 'id') || Date.now(),
     category: field(row, 'category') || '발주 고민',
     title: field(row, 'title') || '',
-    author: field(row, 'author') || '익산 사장님',
+    author: field(row, 'author', 'author_name') || '익산 사장님',
     region: field(row, 'region') || '익산',
     views: numberField(row, 0, 'views'),
     comments: numberField(row, 0, 'comments'),
@@ -384,19 +464,7 @@ function normalizeCommunityPost(row) {
 
 function communityPayload(post) {
   return {
-    category: post.category,
     title: post.title,
-    author: post.author,
-    region: post.region,
-    views: post.views,
-    comments: post.comments,
-    likes: post.likes,
-    time: post.time,
-    tags: post.tags,
-    badge: post.badge,
-    accepted: post.accepted,
-    useful: post.useful,
-    me_too: post.meToo,
   };
 }
 
@@ -409,7 +477,7 @@ function normalizeIssue(row) {
     detail: field(row, 'detail') || '',
     items: field(row, 'items') || '미지정',
     impact: field(row, 'impact') || '분석 대기',
-    date: field(row, 'date', 'created_at') || '',
+    date: field(row, 'date', 'event_date', 'created_at') || '',
     source: field(row, 'source') || '사용자 등록',
     sourceUrl: field(row, 'sourceUrl', 'source_url') || 'https://www.sbiz.or.kr/',
     imageUrl: field(row, 'imageUrl', 'image_url') || 'https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=1200&q=80',
@@ -419,17 +487,9 @@ function normalizeIssue(row) {
 
 function issuePayload(issue) {
   return {
-    category: issue.category,
     title: issue.title,
     summary: issue.summary,
-    detail: issue.detail,
-    items: issue.items,
-    impact: issue.impact,
-    date: issue.date,
-    source: issue.source,
     source_url: issue.sourceUrl,
-    image_url: issue.imageUrl,
-    ai: issue.ai,
   };
 }
 
@@ -441,11 +501,11 @@ function App() {
   const [orders, setOrders] = useState([]);
   const [confirmItems, setConfirmItems] = useState([]);
   const [toast, setToast] = useState('');
-  const [mockFail, setMockFail] = useState(false);
   const [supabaseItems, setSupabaseItems] = useState([]);
   const [isOrderSaving, setIsOrderSaving] = useState(false);
+  const mutationLocks = useRef(new Set());
 
-  const items = useMemo(() => (supabaseItems.length ? supabaseItems : inventoryItems).map(enrichItem), [supabaseItems]);
+  const items = useMemo(() => mergeInventoryItems(inventoryItems, supabaseItems), [supabaseItems]);
   const [cart, setCart] = useState({});
   const [selectedIds, setSelectedIds] = useState([]);
 
@@ -460,6 +520,12 @@ function App() {
     window.setTimeout(() => setToast(''), 2400);
   }
 
+  function showToastOnce(key, message) {
+    if (shownToastKeys.has(key)) return;
+    shownToastKeys.add(key);
+    showToast(message);
+  }
+
   useEffect(() => {
     let active = true;
 
@@ -468,7 +534,8 @@ function App() {
         const { data, error } = await supabase.from(table).select('*');
         if (!active) return [];
         if (error) {
-          showToast(`Supabase ${table} 조회 오류: ${errorMessage(error)}`);
+          const message = errorMessage(error);
+          showToastOnce('supabase-select-error', `Supabase ${table} 조회 오류: ${message}`);
           applyRows(fallbackRows);
           return fallbackRows;
         }
@@ -476,7 +543,10 @@ function App() {
         applyRows(rows);
         return rows;
       } catch (error) {
-        if (active) showToast(`Supabase ${table} 연결 오류: ${errorMessage(error)}`);
+        if (active) {
+          const message = errorMessage(error);
+          showToastOnce('supabase-connect-error', `Supabase ${table} 연결 오류: ${message}`);
+        }
         applyRows(fallbackRows);
         return fallbackRows;
       }
@@ -493,7 +563,7 @@ function App() {
       const inventoryRows = await selectTable('inventory_items', normalizeInventoryItem, setSupabaseItems, inventoryItems);
       if (!active) return;
 
-      const sourceItems = (inventoryRows.length ? inventoryRows : inventoryItems).map(enrichItem);
+      const sourceItems = mergeInventoryItems(inventoryItems, inventoryRows);
       const inventoryById = Object.fromEntries(sourceItems.map((item) => [item.id, item]));
 
       await selectTable('cart_items', (row) => normalizeCartItem(row, inventoryById), (rows) => {
@@ -517,19 +587,124 @@ function App() {
     return false;
   }
 
+  function mergeSupabaseInventoryItem(item) {
+    setSupabaseItems((prev) => {
+      const others = prev.filter((row) => row.id !== item.id && row.name !== item.name);
+      return [...others, item];
+    });
+  }
+
+  async function ensureInventoryItem(item) {
+    const itemRef = itemReferenceValue(item);
+    if (isUuid(itemRef)) return item;
+
+    const { data: existingRows, error: selectError } = await supabase
+      .from('inventory_items')
+      .select('*')
+      .eq('name', item.name)
+      .limit(1);
+    if (selectError) {
+      showToast(`재고 품목 조회 오류: ${errorMessage(selectError)}`);
+      return null;
+    }
+
+    const existing = Array.isArray(existingRows) && existingRows[0] ? normalizeInventoryItem(existingRows[0]) : null;
+    if (existing?.id) {
+      const enriched = enrichItem(existing);
+      mergeSupabaseInventoryItem(enriched);
+      return { ...item, inventoryId: enriched.id, inventoryItemId: enriched.id, productId: enriched.id };
+    }
+
+    const insertResult = await runWithSchemaFallback(
+      (payload) => supabase.from('inventory_items').insert(payload).select('*'),
+      inventoryPayload(item),
+    );
+    if (!insertResult.ok) {
+      showToast(`재고 품목 저장 오류: ${errorMessage(insertResult.error)}`);
+      return null;
+    }
+
+    const inserted = insertResult.data?.[0] ? enrichItem(normalizeInventoryItem(insertResult.data[0])) : null;
+    if (!inserted?.id) {
+      showToast('재고 품목 저장 오류: 생성된 품목 ID를 찾지 못했습니다.');
+      return null;
+    }
+
+    mergeSupabaseInventoryItem(inserted);
+    return { ...item, inventoryId: inserted.id, inventoryItemId: inserted.id, productId: inserted.id };
+  }
+  async function reloadCartFromSupabase() {
+    if (!isSupabaseConfigured) return false;
+    const { data: inventoryData, error: inventoryError } = await supabase.from('inventory_items').select('*');
+    if (!inventoryError && Array.isArray(inventoryData)) {
+      setSupabaseItems(inventoryData.map((row) => enrichItem(normalizeInventoryItem(row))));
+    }
+    const sourceItems = !inventoryError && Array.isArray(inventoryData) ? mergeInventoryItems(inventoryItems, inventoryData.map(normalizeInventoryItem)) : items;
+    const inventoryById = Object.fromEntries(sourceItems.map((item) => [item.id, item]));
+    const { data, error } = await supabase.from('cart_items').select('*');
+    if (error) {
+      showToast(`장바구니 조회 오류: ${errorMessage(error)}`);
+      return false;
+    }
+
+    const rows = Array.isArray(data) ? data.map((row) => normalizeCartItem(row, inventoryById)).filter((item) => item.id) : [];
+    const nextCart = Object.fromEntries(rows.map((item) => [item.id, item]));
+    setCart(nextCart);
+    setSelectedIds(selectedIdsFromCart(nextCart));
+    return true;
+  }
+
+  async function reloadOrdersFromSupabase() {
+    if (!isSupabaseConfigured) return false;
+    const { data, error } = await supabase.from('orders').select('*');
+    if (error) {
+      showToast(`발주 조회 오류: ${errorMessage(error)}`);
+      return false;
+    }
+
+    const rows = Array.isArray(data) ? data.map(normalizeOrder) : [];
+    setOrders(rows);
+    return true;
+  }
+
+  async function reloadRows(table, normalize, applyRows, label) {
+    if (!isSupabaseConfigured) return false;
+    const { data, error } = await supabase.from(table).select('*');
+    if (error) {
+      showToast(`${label} 조회 오류: ${errorMessage(error)}`);
+      return false;
+    }
+
+    applyRows(Array.isArray(data) ? data.map(normalize) : []);
+    return true;
+  }
+
+  async function withMutationLock(key, action) {
+    if (mutationLocks.current.has(key)) return false;
+    mutationLocks.current.add(key);
+    try {
+      return await action();
+    } finally {
+      mutationLocks.current.delete(key);
+    }
+  }
+
   async function insertCartItem(item) {
     if (!requireDb('장바구니 추가')) return false;
     try {
+      const dbItem = await ensureInventoryItem(item);
+      if (!dbItem) return false;
+      await supabase.from('cart_items').delete().eq('inventory_item_id', itemReferenceValue(dbItem));
       const insertResult = await runWithSchemaFallback(
         (payload) => supabase.from('cart_items').insert(payload),
-        cartPayload(item),
+        cartPayload(dbItem),
       );
       if (insertResult.ok) return true;
 
       const isDuplicate = insertResult.error?.code === '23505' || errorMessage(insertResult.error).toLowerCase().includes('duplicate');
       if (isDuplicate) {
         const updateResult = await runWithSchemaFallback(
-          (payload) => supabase.from('cart_items').update(payload).eq('item_id', item.id),
+          (payload) => runCartItemFilterRequest((column, value) => supabase.from('cart_items').update(payload).eq(column, value), dbItem, '장바구니 수정'),
           insertResult.payload,
         );
         if (updateResult.error) showToast(`장바구니 중복 항목 수정 오류: ${errorMessage(updateResult.error)}`);
@@ -547,9 +722,11 @@ function App() {
   async function updateCartItem(item) {
     if (!requireDb('장바구니 수정')) return false;
     try {
+      const dbItem = await ensureInventoryItem(item);
+      if (!dbItem) return false;
       const updateResult = await runWithSchemaFallback(
-        (payload) => supabase.from('cart_items').update(payload).eq('item_id', item.id),
-        cartPayload(item),
+        (payload) => runCartItemFilterRequest((column, value) => supabase.from('cart_items').update(payload).eq(column, value), dbItem, '장바구니 수정'),
+        cartPayload(dbItem),
       );
       if (updateResult.error) showToast(`장바구니 수정 오류: ${errorMessage(updateResult.error)}`);
       return updateResult.ok;
@@ -562,9 +739,13 @@ function App() {
   async function deleteCartItems(itemIds) {
     if (!requireDb('장바구니 삭제')) return false;
     try {
-      const { error } = await supabase.from('cart_items').delete().in('item_id', itemIds);
-      if (error) showToast(`장바구니 삭제 오류: ${errorMessage(error)}`);
-      return !error;
+      const result = await runCartItemsFilterRequest(
+        (column, values) => supabase.from('cart_items').delete().in(column, values),
+        itemIds,
+        '장바구니 삭제',
+      );
+      if (result.error) showToast(`장바구니 삭제 오류: ${errorMessage(result.error)}`);
+      return result === true;
     } catch (error) {
       showToast(`장바구니 삭제 오류: ${errorMessage(error)}`);
       return false;
@@ -586,6 +767,7 @@ function App() {
       setSelectedIds(previousSelectedIds);
       return false;
     }
+    await reloadCartFromSupabase();
     showToast(`${item.name} 장바구니에 추가했습니다.`);
     return true;
   }
@@ -609,6 +791,7 @@ function App() {
       setSelectedIds(previousSelectedIds);
       return;
     }
+    await reloadCartFromSupabase();
     showToast('추천 항목을 장바구니에 추가했습니다.');
   }
 
@@ -617,7 +800,12 @@ function App() {
     const previousCart = cart;
     const nextItem = cart[itemId] ? { ...cart[itemId], orderQty: nextQty } : null;
     setCart((prev) => (!prev[itemId] ? prev : { ...prev, [itemId]: { ...prev[itemId], orderQty: nextQty } }));
-    if (nextItem && !(await updateCartItem(nextItem))) setCart(previousCart);
+    if (nextItem && !(await updateCartItem(nextItem))) {
+      setCart(previousCart);
+      return;
+    }
+    await reloadCartFromSupabase();
+    showToast('장바구니 수량을 수정했습니다.');
   }
 
   async function removeCartItem(itemId) {
@@ -629,7 +817,8 @@ function App() {
       return next;
     });
     setSelectedIds((prev) => prev.filter((id) => id !== itemId));
-    if (await deleteCartItems([itemId])) {
+    if (await deleteCartItems([previousCart[itemId] || itemId])) {
+      await reloadCartFromSupabase();
       showToast('장바구니에서 삭제했습니다.');
       return;
     }
@@ -658,17 +847,27 @@ function App() {
 
     let orderId = null;
     try {
-      const { data: orderRows, error: orderError } = await supabase.from('orders').insert(orderPayload(order)).select('id, order_number');
-      if (orderError) {
-        showToast(`발주 저장 오류: ${errorMessage(orderError)}`);
+      const dbOrderItems = [];
+      for (const item of order.items) {
+        const dbItem = await ensureInventoryItem(item);
+        if (!dbItem) return false;
+        dbOrderItems.push(dbItem);
+      }
+
+      const orderResult = await runWithSchemaFallback(
+        (payload) => supabase.from('orders').insert(payload).select('id, order_number'),
+        orderPayload(order),
+      );
+      if (!orderResult.ok) {
+        showToast(`발주 저장 오류: ${errorMessage(orderResult.error)}`);
         return false;
       }
 
-      orderId = orderRows?.[0]?.id || null;
+      orderId = orderResult.data?.[0]?.id || null;
       const orderKey = orderId || order.orderNumber;
       const { error: itemError } = await supabase
         .from('order_items')
-        .insert(order.items.map((item) => orderItemPayload(orderKey, order.orderNumber, item)));
+        .insert(dbOrderItems.map((item) => orderItemPayload(orderKey, order.orderNumber, item)));
 
       if (itemError) {
         if (orderId) await supabase.from('orders').delete().eq('id', orderId);
@@ -677,7 +876,7 @@ function App() {
         return false;
       }
 
-      const cartDeleted = await deleteCartItems(order.items.map((item) => item.id));
+      const cartDeleted = await deleteCartItems(dbOrderItems);
       if (!cartDeleted) return false;
       return true;
     } catch (error) {
@@ -689,11 +888,6 @@ function App() {
 
   async function confirmOrder() {
     if (isOrderSaving) return;
-    if (mockFail) {
-      showToast('발주 실패 mock 상태입니다.');
-      setConfirmItems([]);
-      return;
-    }
     setIsOrderSaving(true);
     const order = {
       orderNumber: makeOrderNumber(),
@@ -708,163 +902,169 @@ function App() {
     setIsOrderSaving(false);
     if (!saved) return;
 
-    setOrders((prev) => [order, ...prev]);
-    setCart((prev) => {
-      const next = { ...prev };
-      confirmItems.forEach((item) => delete next[item.id]);
-      return next;
-    });
-    setSelectedIds((prev) => prev.filter((id) => !confirmItems.some((item) => item.id === id)));
+    await Promise.all([reloadOrdersFromSupabase(), reloadCartFromSupabase()]);
     setConfirmItems([]);
     showToast('발주가 완료되었습니다.');
   }
 
   async function insertEvent(event) {
-    if (!requireDb('특이사항 저장')) return false;
-    try {
-      const { data, error } = await supabase.from('special_events').insert(eventPayload(event)).select('*');
-      if (error) {
+    return withMutationLock('special_events:insert', async () => {
+      if (!requireDb('특이사항 저장')) return false;
+      try {
+        const insertResult = await runWithSchemaFallback(
+          (payload) => supabase.from('special_events').insert(payload).select('*'),
+          eventPayload(event),
+        );
+        if (!insertResult.ok) {
+          showToast(`특이사항 저장 오류: ${errorMessage(insertResult.error)}`);
+          return false;
+        }
+        return reloadRows('special_events', normalizeEvent, setEvents, '특이사항');
+      } catch (error) {
         showToast(`특이사항 저장 오류: ${errorMessage(error)}`);
         return false;
       }
-      setEvents((prev) => [normalizeEvent(data?.[0] || event), ...prev]);
-      return true;
-    } catch (error) {
-      showToast(`특이사항 저장 오류: ${errorMessage(error)}`);
-      return false;
-    }
+    });
   }
 
   async function deleteEvent(eventId) {
-    if (!requireDb('특이사항 삭제')) return false;
-    const previous = events;
-    setEvents((prev) => prev.filter((event) => event.id !== eventId));
-    try {
-      const { error } = await supabase.from('special_events').delete().eq('id', eventId);
-      if (error) {
-        setEvents(previous);
+    return withMutationLock(`special_events:delete:${eventId}`, async () => {
+      if (!requireDb('특이사항 삭제')) return false;
+      try {
+        const { error } = await supabase.from('special_events').delete().eq('id', eventId);
+        if (error) {
+          showToast(`특이사항 삭제 오류: ${errorMessage(error)}`);
+          return false;
+        }
+        await reloadRows('special_events', normalizeEvent, setEvents, '특이사항');
+        showToast('특이사항을 삭제했습니다.');
+        return true;
+      } catch (error) {
         showToast(`특이사항 삭제 오류: ${errorMessage(error)}`);
         return false;
       }
-      showToast('특이사항을 삭제했습니다.');
-      return true;
-    } catch (error) {
-      setEvents(previous);
-      showToast(`특이사항 삭제 오류: ${errorMessage(error)}`);
-      return false;
-    }
+    });
   }
 
   async function insertCommunityPost() {
-    if (!requireDb('게시글 저장')) return false;
-    const post = { id: Date.now(), category: '발주 고민', title: '새 게시글', author: '익산 사장님', region: '익산', views: 0, comments: 0, likes: 0, time: '방금 전', tags: [], badge: '익산 사장님', accepted: false, useful: 0, meToo: 0 };
-    try {
-      const { data, error } = await supabase.from('community_posts').insert(communityPayload(post)).select('*');
-      if (error) {
+    return withMutationLock('community_posts:insert', async () => {
+      if (!requireDb('게시글 저장')) return false;
+      const post = { category: '발주 고민', title: '새 게시글', author: '익산 사장님', region: '익산', views: 0, comments: 0, likes: 0, time: '방금 전', tags: [], badge: '익산 사장님', accepted: false, useful: 0, meToo: 0 };
+      try {
+        const insertResult = await runWithSchemaFallback(
+          (payload) => supabase.from('community_posts').insert(payload).select('*'),
+          communityPayload(post),
+        );
+        if (!insertResult.ok) {
+          showToast(`게시글 저장 오류: ${errorMessage(insertResult.error)}`);
+          return false;
+        }
+        await reloadRows('community_posts', normalizeCommunityPost, setCommunityPosts, '게시글');
+        showToast('게시글이 저장되었습니다.');
+        return true;
+      } catch (error) {
         showToast(`게시글 저장 오류: ${errorMessage(error)}`);
         return false;
       }
-      setCommunityPosts((prev) => [normalizeCommunityPost(data?.[0] || post), ...prev]);
-      showToast('게시글이 저장되었습니다.');
-      return true;
-    } catch (error) {
-      showToast(`게시글 저장 오류: ${errorMessage(error)}`);
-      return false;
-    }
+    });
   }
 
   async function updateCommunityPost(post) {
-    if (!requireDb('게시글 수정')) return false;
-    const previous = communityPosts;
-    setCommunityPosts((prev) => prev.map((item) => (item.id === post.id ? post : item)));
-    try {
-      const { error } = await supabase.from('community_posts').update(communityPayload(post)).eq('id', post.id);
-      if (error) {
-        setCommunityPosts(previous);
+    return withMutationLock(`community_posts:update:${post.id}`, async () => {
+      if (!requireDb('게시글 수정')) return false;
+      try {
+        const updateResult = await runWithSchemaFallback(
+          (payload) => supabase.from('community_posts').update(payload).eq('id', post.id),
+          communityPayload(post),
+        );
+        if (!updateResult.ok) {
+          showToast(`게시글 수정 오류: ${errorMessage(updateResult.error)}`);
+          return false;
+        }
+        return reloadRows('community_posts', normalizeCommunityPost, setCommunityPosts, '게시글');
+      } catch (error) {
         showToast(`게시글 수정 오류: ${errorMessage(error)}`);
         return false;
       }
-      return true;
-    } catch (error) {
-      setCommunityPosts(previous);
-      showToast(`게시글 수정 오류: ${errorMessage(error)}`);
-      return false;
-    }
+    });
   }
 
   async function deleteCommunityPost(postId) {
-    if (!requireDb('게시글 삭제')) return false;
-    const previous = communityPosts;
-    setCommunityPosts((prev) => prev.filter((post) => post.id !== postId));
-    try {
-      const { error } = await supabase.from('community_posts').delete().eq('id', postId);
-      if (error) {
-        setCommunityPosts(previous);
+    return withMutationLock(`community_posts:delete:${postId}`, async () => {
+      if (!requireDb('게시글 삭제')) return false;
+      try {
+        const { error } = await supabase.from('community_posts').delete().eq('id', postId);
+        if (error) {
+          showToast(`게시글 삭제 오류: ${errorMessage(error)}`);
+          return false;
+        }
+        await reloadRows('community_posts', normalizeCommunityPost, setCommunityPosts, '게시글');
+        showToast('게시글을 삭제했습니다.');
+        return true;
+      } catch (error) {
         showToast(`게시글 삭제 오류: ${errorMessage(error)}`);
         return false;
       }
-      showToast('게시글을 삭제했습니다.');
-      return true;
-    } catch (error) {
-      setCommunityPosts(previous);
-      showToast(`게시글 삭제 오류: ${errorMessage(error)}`);
-      return false;
-    }
+    });
   }
 
   async function insertIssue(issue) {
-    if (!requireDb('커피 이슈 저장')) return false;
-    try {
-      const { data, error } = await supabase.from('coffee_issues').insert(issuePayload(issue)).select('*');
-      if (error) {
+    return withMutationLock('coffee_issues:insert', async () => {
+      if (!requireDb('커피 이슈 저장')) return false;
+      try {
+        const insertResult = await runWithSchemaFallback(
+          (payload) => supabase.from('coffee_issues').insert(payload).select('*'),
+          issuePayload(issue),
+        );
+        if (!insertResult.ok) {
+          showToast(`커피 이슈 저장 오류: ${errorMessage(insertResult.error)}`);
+          return false;
+        }
+        return reloadRows('coffee_issues', normalizeIssue, setIssues, '커피 이슈');
+      } catch (error) {
         showToast(`커피 이슈 저장 오류: ${errorMessage(error)}`);
         return false;
       }
-      setIssues((prev) => [normalizeIssue(data?.[0] || issue), ...prev]);
-      return true;
-    } catch (error) {
-      showToast(`커피 이슈 저장 오류: ${errorMessage(error)}`);
-      return false;
-    }
+    });
   }
 
   async function updateIssue(issue) {
-    if (!requireDb('커피 이슈 수정')) return false;
-    const previous = issues;
-    setIssues((prev) => prev.map((item) => (item.id === issue.id ? issue : item)));
-    try {
-      const { error } = await supabase.from('coffee_issues').update(issuePayload(issue)).eq('id', issue.id);
-      if (error) {
-        setIssues(previous);
+    return withMutationLock(`coffee_issues:update:${issue.id}`, async () => {
+      if (!requireDb('커피 이슈 수정')) return false;
+      try {
+        const updateResult = await runWithSchemaFallback(
+          (payload) => supabase.from('coffee_issues').update(payload).eq('id', issue.id),
+          issuePayload(issue),
+        );
+        if (!updateResult.ok) {
+          showToast(`커피 이슈 수정 오류: ${errorMessage(updateResult.error)}`);
+          return false;
+        }
+        return reloadRows('coffee_issues', normalizeIssue, setIssues, '커피 이슈');
+      } catch (error) {
         showToast(`커피 이슈 수정 오류: ${errorMessage(error)}`);
         return false;
       }
-      return true;
-    } catch (error) {
-      setIssues(previous);
-      showToast(`커피 이슈 수정 오류: ${errorMessage(error)}`);
-      return false;
-    }
+    });
   }
 
   async function deleteIssue(issueId) {
-    if (!requireDb('커피 이슈 삭제')) return false;
-    const previous = issues;
-    setIssues((prev) => prev.filter((issue) => issue.id !== issueId));
-    try {
-      const { error } = await supabase.from('coffee_issues').delete().eq('id', issueId);
-      if (error) {
-        setIssues(previous);
+    return withMutationLock(`coffee_issues:delete:${issueId}`, async () => {
+      if (!requireDb('커피 이슈 삭제')) return false;
+      try {
+        const { error } = await supabase.from('coffee_issues').delete().eq('id', issueId);
+        if (error) {
+          showToast(`커피 이슈 삭제 오류: ${errorMessage(error)}`);
+          return false;
+        }
+        await reloadRows('coffee_issues', normalizeIssue, setIssues, '커피 이슈');
+        showToast('커피 이슈를 삭제했습니다.');
+        return true;
+      } catch (error) {
         showToast(`커피 이슈 삭제 오류: ${errorMessage(error)}`);
         return false;
       }
-      showToast('커피 이슈를 삭제했습니다.');
-      return true;
-    } catch (error) {
-      setIssues(previous);
-      showToast(`커피 이슈 삭제 오류: ${errorMessage(error)}`);
-      return false;
-    }
+    });
   }
   return (
     <div className="app">
@@ -885,11 +1085,11 @@ function App() {
         {activePage === 'community' && <CommunityPage posts={communityPosts} insertCommunityPost={insertCommunityPost} updateCommunityPost={updateCommunityPost} deleteCommunityPost={deleteCommunityPost} showToast={showToast} />}
         {activePage === 'issues' && <IssuesPage issues={issues} insertIssue={insertIssue} updateIssue={updateIssue} deleteIssue={deleteIssue} showToast={showToast} />}
         {activePage === 'reports' && <ReportPage addAllRecommendations={addAllRecommendations} setActivePage={setActivePage} />}
-        {activePage === 'settings' && <SettingsPage mockFail={mockFail} setMockFail={setMockFail} />}
+        {activePage === 'settings' && <SettingsPage />}
       </main>
 
       {!!confirmItems.length && <OrderConfirmModal items={confirmItems} onCancel={() => setConfirmItems([])} onConfirm={confirmOrder} isSaving={isOrderSaving} />}
-      {toast && <div className="toast">{toast}</div>}
+      {toast && <div className="toast" data-testid="toast">{toast}</div>}
     </div>
   );
 }
@@ -901,7 +1101,7 @@ function Sidebar({ activePage, setActivePage }) {
       <nav>
         {menus.map((item) => {
           const Icon = item.icon;
-          return <button key={item.key} className={activePage === item.key ? 'active' : ''} onClick={() => setActivePage(item.key)}><Icon size={18} /><span>{item.label}</span></button>;
+          return <button key={item.key} data-testid={`nav-${item.key}`} className={activePage === item.key ? 'active' : ''} onClick={() => setActivePage(item.key)}><Icon size={18} /><span>{item.label}</span></button>;
         })}
       </nav>
     </aside>
@@ -918,7 +1118,7 @@ function Header({ activePage, cartCount }) {
       </div>
       <div className="headerActions">
         <span><Bell size={16} /> AI 분석 갱신 3분 전</span>
-        <span><ShoppingCart size={16} /> 장바구니 {cartCount}</span>
+        <span data-testid="cart-count"><ShoppingCart size={16} /> 장바구니 {cartCount}</span>
       </div>
     </header>
   );
@@ -1024,7 +1224,7 @@ function RecommendationCards({ items, addItemToCart, startImmediateOrder }) {
       {items.map((item) => {
         const status = getPsiStatus(item.psi);
         return (
-          <article className="recommendCard" key={item.id}>
+          <article className="recommendCard" key={item.id} data-testid="recommend-card" data-item-name={item.name}>
             <div className="rowBetween"><strong>{item.name}</strong><span className={`pill ${status.className}`}>{item.action}</span></div>
             <dl>
               <div><dt>현재</dt><dd>{numberFormat(item.currentStock)}{item.unit}</dd></div>
@@ -1033,7 +1233,7 @@ function RecommendationCards({ items, addItemToCart, startImmediateOrder }) {
               <div><dt>PSI</dt><dd>{item.psi} <PsiInfo /></dd></div>
             </dl>
             <p>{item.reason}</p>
-            <div className="buttonPair"><button onClick={() => addItemToCart(item)}>담기</button><button className="dangerButton" onClick={() => startImmediateOrder(item)}>즉시 발주</button></div>
+            <div className="buttonPair"><button data-testid={`add-cart-${item.name}`} onClick={() => addItemToCart(item)}>담기</button><button className="dangerButton" onClick={() => startImmediateOrder(item)}>즉시 발주</button></div>
           </article>
         );
       })}
@@ -1088,7 +1288,7 @@ function CartOrderPanel({ cartItems, selectedIds, setSelectedIds, selectedItems,
   const selectedDelivery = selectedItems[0]?.expectedDeliveryDate || '-';
   const toggleSelected = (id) => setSelectedIds((prev) => (prev.includes(id) ? prev.filter((itemId) => itemId !== id) : [...prev, id]));
 
-  if (!cartItems.length) return <p className="empty">장바구니가 비었습니다. AI 발주에서 추천안을 생성해 주세요.</p>;
+  if (!cartItems.length) return <p className="empty" data-testid="cart-empty">장바구니가 비었습니다. AI 발주에서 추천안을 생성해 주세요.</p>;
 
   return (
     <>
@@ -1096,19 +1296,19 @@ function CartOrderPanel({ cartItems, selectedIds, setSelectedIds, selectedItems,
         {cartItems.map((item) => {
           const status = getPsiStatus(item.psi);
           return (
-            <article className="cartOrderCard" key={item.id}>
+            <article className="cartOrderCard" key={item.id} data-testid="cart-item" data-item-name={item.name}>
               <label className="checkLine"><input type="checkbox" checked={selectedIds.includes(item.id)} onChange={() => toggleSelected(item.id)} /><strong>{item.name}</strong><span className={`pill ${status.className}`}>PSI {item.psi}</span></label>
               <div className="cartDetails">
                 <span>현재 재고 <b>{numberFormat(item.currentStock)}{item.unit}</b></span>
                 <span>AI 권장 <b>{numberFormat(item.recommendedQty)}{item.unit}</b></span>
-                <label>수량 변경 <input type="number" min="1" value={item.orderQty} onChange={(event) => updateCartQty(item.id, event.target.value)} /></label>
+                <label>수량 변경 <input data-testid="cart-qty" type="number" min="1" value={item.orderQty} onChange={(event) => updateCartQty(item.id, event.target.value)} /></label>
                 <span>단가 <b>{currency(item.unitCost)}</b></span>
                 <span>총액 <b>{currency(item.orderQty * item.unitCost)}</b></span>
                 <span>공급사 <b>{item.supplier}</b></span>
                 <span>배송예정일 <b>{item.expectedDeliveryDate}</b></span>
                 <span>추천 이유 <b>{item.reason}</b></span>
               </div>
-              <div className="cartActions"><button className="subtleButton" onClick={() => removeCartItem(item.id)}><Trash2 size={15} /> 삭제</button><button onClick={() => openOrderConfirm([item])}>개별 발주</button></div>
+              <div className="cartActions"><button data-testid="cart-delete" className="subtleButton" onClick={() => removeCartItem(item.id)}><Trash2 size={15} /> 삭제</button><button onClick={() => openOrderConfirm([item])}>개별 발주</button></div>
             </article>
           );
         })}
@@ -1118,8 +1318,8 @@ function CartOrderPanel({ cartItems, selectedIds, setSelectedIds, selectedItems,
         <span>선택 {selectedItems.length}개</span>
         <strong>{currency(selectedTotal)}</strong>
         <span>예상 배송 {selectedDelivery}</span>
-        <button onClick={() => openOrderConfirm(selectedItems)}>선택 발주</button>
-        <button className="dangerButton" onClick={() => openOrderConfirm(cartItems)}>전체 발주</button>
+        <button data-testid="order-selected" onClick={() => openOrderConfirm(selectedItems)}>선택 발주</button>
+        <button data-testid="order-all" className="dangerButton" onClick={() => openOrderConfirm(cartItems)}>전체 발주</button>
       </div>
     </>
   );
@@ -1129,13 +1329,13 @@ function OrderConfirmModal({ items, onCancel, onConfirm, isSaving }) {
   const totalAmount = items.reduce((sum, item) => sum + item.orderQty * item.unitCost, 0);
   const suppliers = Array.from(new Set(items.map((item) => item.supplier))).join(', ');
   return (
-    <div className="modalBackdrop">
+    <div className="modalBackdrop" data-testid="order-modal">
       <section className="modal">
         <h2>발주 확인</h2>
         <div className="modalSummary"><span>총 품목 <b>{items.length}개</b></span><span>총 금액 <b>{currency(totalAmount)}</b></span><span>공급사 <b>{suppliers}</b></span><span>예상 배송일 <b>{items[0]?.expectedDeliveryDate || '-'}</b></span></div>
         <div className="modalItems">{items.map((item) => <div key={item.id}><strong>{item.name}</strong><span>{numberFormat(item.orderQty)}{item.unit} · {currency(item.orderQty * item.unitCost)}</span></div>)}</div>
         <p className="warningText">확정 시 주문번호가 생성되고 발주 내역에 저장되며 장바구니에서 제거됩니다.</p>
-        <div className="modalActions"><button className="subtleButton" onClick={onCancel} disabled={isSaving}>취소</button><button onClick={onConfirm} disabled={isSaving}>{isSaving ? '저장 중' : '발주 확정'}</button></div>
+        <div className="modalActions"><button className="subtleButton" onClick={onCancel} disabled={isSaving}>취소</button><button data-testid="confirm-order" onClick={onConfirm} disabled={isSaving}>{isSaving ? '저장 중' : '발주 확정'}</button></div>
       </section>
     </div>
   );
@@ -1322,7 +1522,7 @@ function DataTable({ rows, columns, categories, action }) {
         <table>
           <thead><tr>{columns.map(([key, label]) => <th key={key}>{label}</th>)}{action && <th>작업</th>}</tr></thead>
           <tbody>
-            {filter.visibleRows.map((row) => <tr key={row.id || row.orderNumber}>{columns.map(([key, , format]) => <td key={key}>{format ? format(row[key], row) : String(row[key] ?? '')}</td>)}{action && <td>{action(row)}</td>}</tr>)}
+            {filter.visibleRows.map((row) => <tr key={row.id || row.orderNumber} data-testid="data-row" data-row-title={row.title || row.name || row.orderNumber || ''}>{columns.map(([key, , format]) => <td key={key}>{format ? format(row[key], row) : String(row[key] ?? '')}</td>)}{action && <td>{action(row)}</td>}</tr>)}
           </tbody>
         </table>
       </div>
@@ -1346,14 +1546,13 @@ function ReportPage({ addAllRecommendations, setActivePage }) {
   );
 }
 
-function SettingsPage({ mockFail, setMockFail }) {
+function SettingsPage() {
   return (
     <Card title="설정">
       <div className="settingsGrid">
         <label><span>자동발주 모드</span><select defaultValue="review"><option value="review">검토 후 실행</option><option value="auto">위험 품목 자동 실행</option></select></label>
         <label><span>PSI 위험 기준</span><input defaultValue="49" /></label>
         <label><span>외부 연동 준비</span><input defaultValue="뉴스 API, 날씨 API, POS, ERP, 공급사 API" /></label>
-        <label className="toggleLine"><input type="checkbox" checked={mockFail} onChange={(event) => setMockFail(event.target.checked)} /> 발주 실패 mock 테스트</label>
       </div>
     </Card>
   );
